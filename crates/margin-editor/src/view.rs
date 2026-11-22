@@ -4,7 +4,8 @@
 //! viewport top (negative inside its hint row). Hint rows appearing/disappearing keep the text still.
 //! Max scroll: the last line can rise to the middle of the view. The scrollbar is line-based (no total height).
 //!
-//! Frame order: metrics → hit-test views → mouse → keys → find → reveal → lex (budget) → views → paint → find bar.
+//! Frame order: metrics → hit-test views → queued actions → context menu input → mouse → keys → find → reveal →
+//! lex (budget) → views → paint → find bar → context menu.
 
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use margin_theme::Theme;
 use crate::findbar::FindUi;
 use crate::layout::{Lay, LineView};
 use crate::undo::Sel;
-use crate::{Document, EditorOptions, EditorOutput, Lens, Pos, Wrap};
+use crate::{Document, EditAction, EditorOptions, EditorOutput, Lens, Pos, Wrap};
 
 pub const LEX_BUDGET: Duration = Duration::from_millis(3);
 pub const FIND_BUDGET: Duration = Duration::from_millis(3);
@@ -86,6 +87,10 @@ pub struct View {
     pub ctrl_word: Option<(u32, u32, u32)>,
     /// Caret rect drawn last frame (screen), when visible.
     pub caret: Option<Rect>,
+    /// Open context menu.
+    pub menu: Option<crate::menu::Menu>,
+    /// Actions chosen in the context menu, applied by the next frame.
+    pub picks: Vec<EditAction>,
 }
 
 /// A laid-out visible line: `y` = screen y of its first text row.
@@ -105,6 +110,8 @@ pub struct Cx<'a, 'b> {
     pub mac: bool,
     pub toks: Vec<Token>,
     pub copy: Option<String>,
+    /// Ask the platform for the clipboard (`ViewportCommand::RequestPaste`).
+    pub paste: bool,
     pub dollar: bool,
 }
 
@@ -361,13 +368,13 @@ pub fn hit_test(vis: &[Vis], lay: &Lay<'_>, doc: &Document, text: Rect, scroll_x
 }
 
 /// The whole frame.
-pub fn show(ui: &mut egui::Ui, doc: &mut Document, v: &mut View, opts: &EditorOptions, theme: &Theme, lenses: &[Lens]) -> EditorOutput {
+pub fn show(ui: &mut egui::Ui, doc: &mut Document, v: &mut View, queued: &[EditAction], opts: &EditorOptions, theme: &Theme, lenses: &[Lens]) -> EditorOutput {
     let mut out = EditorOutput::default();
     let rect = ui.available_rect_before_wrap();
     let id = ui.make_persistent_id("margin-editor");
     let resp = ui.interact(rect, id, Sense::click_and_drag());
     ui.advance_cursor_after_rect(rect);
-    if opts.request_focus || std::mem::take(&mut v.focus_text) {
+    if opts.request_focus || std::mem::take(&mut v.focus_text) || !queued.is_empty() || !v.picks.is_empty() {
         ui.memory_mut(|m| m.request_focus(id));
     }
     v.clamp_to(doc);
@@ -419,8 +426,13 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, v: &mut View, opts: &EditorOp
     let vis0 = v.visible(&lay, doc, text, &mut toks);
     let rev0 = doc.revision();
     {
-        let mut cx = Cx { doc, v, lay: &lay, opts, out: &mut out, time, mac, toks: std::mem::take(&mut toks), copy: None, dollar };
+        let mut cx = Cx { doc, v, lay: &lay, opts, out: &mut out, time, mac, toks: std::mem::take(&mut toks), copy: None, paste: false, dollar };
+        let picks = std::mem::take(&mut cx.v.picks);
+        for &a in queued.iter().chain(&picks) {
+            cx.action(a);
+        }
         crate::input::lens_widgets(ui, &mut cx, &vis0, text, id);
+        crate::menu::input(ui, &mut cx, &resp, &vis0, id);
         crate::input::mouse(ui, &mut cx, &resp, &vis0, id);
         if ui.memory(|m| m.has_focus(id)) {
             ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false }));
@@ -428,6 +440,9 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, v: &mut View, opts: &EditorOp
         }
         if let Some(t) = cx.copy.take() {
             ctx.copy_text(t);
+        }
+        if cx.paste {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
         }
         crate::findbar::step(&mut cx);
         toks = std::mem::take(&mut cx.toks);
@@ -464,6 +479,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, v: &mut View, opts: &EditorOp
     crate::paint::paint(ui, doc, v, &lay, opts, &vis, focused, &resp, gutter_w, ppp, dollar);
     crate::paint::scrollbars(ui, doc, v, &lay, &resp, &mut toks, id);
     crate::findbar::ui(ui, doc, v, theme, rect, &mut out, id);
+    crate::menu::ui(ui, doc, v, theme, &mut out, id, mac);
 
     v.caret = crate::paint::cursor_rect(v, &lay, doc, &vis, ppp).filter(|r| text.expand(1.0).contains(r.center()));
     if focused {

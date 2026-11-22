@@ -9,10 +9,17 @@
 //! | PageUp / PageDown | one view |
 //! | + Shift | extend the selection |
 //! | Backspace / Delete · ⌥ / Ctrl · ⌘ | char · word · to line start/end |
-//! | Enter · Tab · Shift+Tab | newline + indent · indent or tab · outdent |
+//! | Enter · Tab · Shift+Tab | newline + auto-indent (`indent.rs`) · indent or tab · outdent |
+//! | ⌘/Ctrl+] · ⌘/Ctrl+[ | indent · outdent the touched lines |
+//! | ⌥↑/↓ · Shift+⌥↑/↓ · ⌘/Ctrl+Shift+D | move lines · duplicate lines up/down · duplicate down |
+//! | ⌘/Ctrl+Shift+K | delete lines |
 //! | ⌘/Ctrl+Z · ⌘/Ctrl+Shift+Z · Ctrl+Y | undo · redo · redo |
 //! | ⌘/Ctrl+A · ⌘/Ctrl+/ · F12 | select all · toggle comment · go to definition |
 //! | Esc | close the find bar (only when open) |
+//! | prose, Tab / Shift+Tab on a list item | indent / outdent the item |
+//!
+//! Clipboard: `Event::Copy` / `Cut` → `ctx.copy_text`; `Event::Paste` inserted as is (CRLF / CR → line breaks,
+//! no re-indent). `EditAction::Paste` sends `ViewportCommand::RequestPaste`; the text comes back as `Event::Paste`.
 //!
 //! | Mouse | Action |
 //! |---|---|
@@ -29,7 +36,7 @@ use crate::ops::{self, Reach, Tabs};
 use crate::text::{floor_boundary, indent_len, next_boundary, prev_boundary, word_left, word_range_at, word_right};
 use crate::undo::{Kind, Sel};
 use crate::view::{hit_test, Cx, DragMode, Hit, Reveal, Vis};
-use crate::Pos;
+use crate::{EditAction, Pos};
 
 impl Cx<'_, '_> {
     fn tabs(&self) -> Tabs {
@@ -167,14 +174,72 @@ impl Cx<'_, '_> {
         self.vertical(if down { rows } else { -rows }, extend);
     }
 
-    fn insert_text(&mut self, t: &str) {
-        let t = t.replace("\r\n", "\n");
+    /// Insert typed (`paste == false`: coalesces) or pasted text (one undo step). CRLF and CR become `\n`.
+    fn insert_text(&mut self, t: &str, paste: bool) {
+        let t = if t.contains('\r') { t.replace("\r\n", "\n").replace('\r', "\n") } else { t.to_owned() };
         if t.is_empty() {
             return;
         }
-        let kind = if t.contains('\n') { Kind::Other } else { Kind::Type };
+        let kind = if paste || t.contains('\n') { Kind::Other } else { Kind::Type };
         let r = ops::insert(self.doc, self.v.sel, &t, kind, self.time);
         self.apply(r);
+    }
+
+    /// Typed text: a closing bracket may re-indent its line.
+    fn type_text(&mut self, t: &str) {
+        if self.opts.auto_indent {
+            let mut cs = t.chars();
+            if let (Some(c), None) = (cs.next(), cs.next()) {
+                let tabs = self.tabs();
+                if let Some(r) = crate::indent::closer(self.doc, self.v.sel, c, &tabs, self.time) {
+                    self.apply(r);
+                    return;
+                }
+            }
+        }
+        self.insert_text(t, false);
+    }
+
+    /// One `EditAction` (queued by the shell or chosen in the context menu).
+    pub fn action(&mut self, a: EditAction) {
+        let time = self.time;
+        let tabs = self.tabs();
+        let s = self.v.sel;
+        let r = match a {
+            EditAction::Undo => self.doc.undo_group(),
+            EditAction::Redo => self.doc.redo_group(),
+            EditAction::Copy => {
+                self.copy = Some(ops::copy_text(self.doc, s));
+                None
+            }
+            EditAction::Cut => ops::cut(self.doc, s, time).map(|(t, sel)| {
+                self.copy = Some(t);
+                sel
+            }),
+            EditAction::Paste => {
+                self.paste = !self.doc.read_only();
+                None
+            }
+            EditAction::SelectAll => {
+                self.v.sel = Sel { anchor: (0, 0), head: self.doc.buf.end_pos() };
+                self.v.up = false;
+                None
+            }
+            EditAction::ToggleComment => self.doc.lang().line_comment().and_then(|p| ops::toggle_comment(self.doc, s, p, time)),
+            EditAction::Indent => ops::indent(self.doc, s, &tabs, time),
+            EditAction::Outdent => ops::outdent(self.doc, s, &tabs, time),
+            EditAction::DuplicateLine => ops::duplicate_lines(self.doc, s, true, time),
+            EditAction::DeleteLine => ops::delete_lines(self.doc, s, time),
+            EditAction::MoveLineUp => ops::move_lines(self.doc, s, true, time),
+            EditAction::MoveLineDown => ops::move_lines(self.doc, s, false, time),
+        };
+        self.apply(r);
+    }
+
+    /// Prose list item on the caret's line (Tab indents the item, not the caret).
+    fn on_list_item(&self) -> bool {
+        let (a, b) = self.sel_range();
+        self.opts.auto_indent && self.doc.lang().is_prose() && a.0 == b.0 && crate::indent::list_item(self.doc.line(a.0)).is_some()
     }
 
     /// One key press. Returns true when handled.
@@ -208,8 +273,11 @@ impl Cx<'_, '_> {
                 if line_mod {
                     let p = if down { self.doc.buf.end_pos() } else { (0, 0) };
                     self.go(p, shift);
+                } else if m.alt && !m.ctrl && !cmd {
+                    let r = if shift { ops::duplicate_lines(self.doc, self.v.sel, down, time) } else { ops::move_lines(self.doc, self.v.sel, !down, time) };
+                    self.apply(r);
                 } else if m.alt || (m.ctrl && !mac) {
-                    return false; // line moves / scroll: not ours
+                    return false; // scroll: not ours
                 } else {
                     self.vertical(if down { 1 } else { -1 }, shift);
                 }
@@ -241,14 +309,20 @@ impl Cx<'_, '_> {
                 if cmd || m.alt || m.ctrl {
                     return false;
                 }
-                let r = ops::newline(self.doc, self.v.sel, &tabs, time);
+                let r = crate::indent::newline(self.doc, self.v.sel, &tabs, self.opts.auto_indent, time);
                 self.apply(r);
             }
             Key::Tab => {
                 if cmd || m.alt || m.ctrl {
                     return false;
                 }
-                let r = if shift { ops::outdent(self.doc, self.v.sel, &tabs, time) } else { ops::tab(self.doc, self.v.sel, &tabs, time) };
+                let r = if shift {
+                    ops::outdent(self.doc, self.v.sel, &tabs, time)
+                } else if self.on_list_item() {
+                    ops::indent(self.doc, self.v.sel, &tabs, time)
+                } else {
+                    ops::tab(self.doc, self.v.sel, &tabs, time)
+                };
                 self.apply(r);
             }
             Key::Z if cmd => {
@@ -262,6 +336,18 @@ impl Cx<'_, '_> {
             Key::A if cmd && !shift => {
                 self.v.sel = Sel { anchor: (0, 0), head: self.doc.buf.end_pos() };
                 self.v.up = false;
+            }
+            Key::CloseBracket | Key::OpenBracket if cmd && !shift && !m.alt => {
+                let r = if key == Key::CloseBracket { ops::indent(self.doc, self.v.sel, &tabs, time) } else { ops::outdent(self.doc, self.v.sel, &tabs, time) };
+                self.apply(r);
+            }
+            Key::D if cmd && shift => {
+                let r = ops::duplicate_lines(self.doc, self.v.sel, true, time);
+                self.apply(r);
+            }
+            Key::K if cmd && shift => {
+                let r = ops::delete_lines(self.doc, self.v.sel, time);
+                self.apply(r);
             }
             Key::Slash if cmd => {
                 if let Some(p) = self.doc.lang().line_comment() {
@@ -298,7 +384,7 @@ pub fn keys(ui: &mut egui::Ui, cx: &mut Cx<'_, '_>) {
             Event::Text(t) => {
                 if cx.v.preedit.is_none() {
                     let clean: String = t.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                    cx.insert_text(&clean);
+                    cx.type_text(&clean);
                 }
                 true
             }
@@ -310,19 +396,14 @@ pub fn keys(ui: &mut egui::Ui, cx: &mut Cx<'_, '_>) {
                     }
                     ImeEvent::Commit(t) => {
                         cx.v.preedit = None;
-                        cx.insert_text(t);
+                        cx.insert_text(t, false);
                     }
                     _ => {}
                 }
                 true
             }
             Event::Copy => {
-                let (a, b) = ops::copy_range(cx.doc, cx.v.sel);
-                let mut t = cx.doc.buf.slice(a, b);
-                if cx.v.sel.anchor == cx.v.sel.head && !t.ends_with('\n') {
-                    t = format!("{}\n", t.trim_start_matches('\n'));
-                }
-                cx.copy = Some(t);
+                cx.copy = Some(ops::copy_text(cx.doc, cx.v.sel));
                 true
             }
             Event::Cut => {
@@ -333,7 +414,7 @@ pub fn keys(ui: &mut egui::Ui, cx: &mut Cx<'_, '_>) {
                 true
             }
             Event::Paste(t) => {
-                cx.insert_text(t);
+                cx.insert_text(t, true);
                 true
             }
             Event::Key { key, pressed: true, modifiers, .. } => cx.key(*key, *modifiers),

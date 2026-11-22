@@ -17,8 +17,9 @@
 //! | `lexcache` | lexer state per line start, lazy + budgeted |
 //! | `text` · `display` | char classes, hazards · display string + column mapping |
 //! | `layout` · `lens` | galleys, wrap rows · hint rows |
-//! | `view` · `input` · `paint` | scroll/frame · keys and mouse · drawing |
-//! | `ops` · `find` · `findbar` | editing commands · search · find bar |
+//! | `view` · `input` · `paint` | scroll/frame · keys, mouse, actions · drawing |
+//! | `ops` · `indent` · `menu` | editing commands · auto-indent · context menu |
+//! | `find` · `findbar` | search · find bar |
 
 mod buffer;
 mod display;
@@ -27,10 +28,12 @@ mod find;
 mod findbar;
 #[cfg(test)]
 mod fuzz;
+mod indent;
 mod input;
 mod layout;
 mod lens;
 mod lexcache;
+mod menu;
 mod ops;
 mod paint;
 #[cfg(test)]
@@ -394,6 +397,11 @@ impl EditorState {
     pub fn find_status(&self) -> String {
         self.v.find.counter()
     }
+
+    /// The context menu is open (it takes ↑/↓/Enter/Esc while open).
+    pub fn context_menu_open(&self) -> bool {
+        self.v.menu.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -414,10 +422,12 @@ pub struct EditorOutput {
 
 /// Draw the editor in all the space `ui` has left and handle its input.
 /// The widget owns: typing, IME, clipboard, selection (mouse + keyboard, word/line by double/triple click),
-/// undo/redo (cmd/ctrl+z, shift+z / y), indent/outdent, find bar (when open), scrolling.
+/// undo/redo (cmd/ctrl+z, shift+z / y), indent/outdent, auto-indent, line move/duplicate/delete, find bar (when open),
+/// context menu, scrolling, `EditorState::run` actions (applied here, in order; they take keyboard focus).
 /// It does not own: save, open, tabs, any shortcut not listed above (left in the input for the shell).
 pub fn show(ui: &mut egui::Ui, doc: &mut Document, state: &mut EditorState, opts: &EditorOptions, theme: &Theme, lenses: &[Lens]) -> EditorOutput {
-    view::show(ui, doc, &mut state.v, opts, theme, lenses)
+    let queued = std::mem::take(&mut state.queued);
+    view::show(ui, doc, &mut state.v, &queued, opts, theme, lenses)
 }
 
 #[cfg(test)]
@@ -478,7 +488,7 @@ mod tests {
         for (i, ch) in "hello".chars().enumerate() {
             s = ops::insert(&mut d, s, &ch.to_string(), undo::Kind::Type, i as f64 * 0.1).unwrap();
         }
-        s = ops::newline(&mut d, s, &ops::Tabs { width: 4, soft: true }, 0.6).unwrap();
+        s = indent::newline(&mut d, s, &ops::Tabs { width: 4, soft: true }, true, 0.6).unwrap();
         s = ops::insert(&mut d, s, "x", undo::Kind::Type, 0.7).unwrap();
         s = ops::insert(&mut d, s, "y", undo::Kind::Type, 5.0).unwrap(); // pause
         assert_eq!(s.head, (1, 2));

@@ -3,11 +3,13 @@
 //! | Op | Behaviour |
 //! |---|---|
 //! | `insert` | replace the selection; `Kind::Type` coalesces |
-//! | `newline` | copy the line's indentation; one more level after `{ ( [ :` |
+//! | `newline` | see `indent.rs` (auto-indent) |
 //! | `backspace` / `delete` | selection, else char (cluster) / word / to line edge; soft tabs: one indent level in leading spaces |
 //! | `tab` | multi-line selection: indent; else a tab or spaces to the next stop |
 //! | `indent` / `outdent` | every line touched by the selection (a line only touched at col 0 by the end is skipped) |
 //! | `toggle_comment` | all lines commented → uncomment, else comment at the minimum indentation |
+//! | `duplicate_lines` · `delete_lines` · `move_lines` | whole lines touched by the selection |
+//! | `copy_text` · `cut` | the selection, or the whole line with its break when empty |
 
 use crate::buffer::order;
 use crate::text::{floor_boundary, indent_len, next_boundary, prev_boundary, word_left, word_right};
@@ -28,7 +30,7 @@ pub struct Tabs {
 }
 
 impl Tabs {
-    fn unit(&self) -> String {
+    pub fn unit(&self) -> String {
         if self.soft {
             " ".repeat(self.width.clamp(1, 16) as usize)
         } else {
@@ -44,20 +46,6 @@ fn range(s: Sel) -> (Pos, Pos) {
 pub fn insert(doc: &mut Document, s: Sel, text: &str, kind: Kind, time: f64) -> Option<Sel> {
     let (a, b) = range(s);
     doc.group(kind, time, s, |tx| Sel::caret(tx.edit(a, b, text)))
-}
-
-pub fn newline(doc: &mut Document, s: Sel, tabs: &Tabs, time: f64) -> Option<Sel> {
-    let (a, _) = range(s);
-    let line = doc.line(a.0);
-    let col = a.1 as usize;
-    let ind = &line[..indent_len(line).min(col)];
-    let before = line[..floor_boundary(line, col)].trim_end();
-    let mut text = String::from("\n");
-    text.push_str(ind);
-    if before.ends_with(['{', '(', '[', ':']) {
-        text.push_str(&tabs.unit());
-    }
-    insert(doc, s, &text, Kind::Other, time)
 }
 
 pub fn backspace(doc: &mut Document, s: Sel, reach: Reach, tabs: &Tabs, time: f64) -> Option<Sel> {
@@ -257,6 +245,77 @@ pub fn copy_range(doc: &Document, s: Sel) -> (Pos, Pos) {
     }
 }
 
+/// What Copy puts on the clipboard.
+pub fn copy_text(doc: &Document, s: Sel) -> String {
+    let (a, b) = copy_range(doc, s);
+    let mut t = doc.buf.slice(a, b);
+    if s.anchor == s.head && !t.ends_with('\n') {
+        t = format!("{}\n", t.trim_start_matches('\n'));
+    }
+    t
+}
+
+/// Shift a selection by `d` lines (clamped at the next `show`).
+fn shift_lines(s: Sel, d: i64) -> Sel {
+    let f = |p: Pos| ((i64::from(p.0) + d).clamp(0, i64::from(u32::MAX)) as u32, p.1);
+    Sel { anchor: f(s.anchor), head: f(s.head) }
+}
+
+/// Copy the touched lines below (`below`, the selection follows the copy) or above (the selection stays).
+pub fn duplicate_lines(doc: &mut Document, s: Sel, below: bool, time: f64) -> Option<Sel> {
+    let (l0, l1) = sel_lines(s);
+    let end = (l1, doc.line(l1).len() as u32);
+    let block = doc.buf.slice((l0, 0), end);
+    let n = i64::from(l1 - l0 + 1);
+    doc.group(Kind::Other, time, s, |tx| {
+        tx.edit(end, end, &format!("\n{block}"));
+        if below {
+            shift_lines(s, n)
+        } else {
+            s
+        }
+    })
+}
+
+/// Remove the touched lines with their breaks; the cursor keeps its column on the line that takes their place.
+pub fn delete_lines(doc: &mut Document, s: Sel, time: f64) -> Option<Sel> {
+    let (l0, l1) = sel_lines(s);
+    let n = doc.line_count();
+    let col = s.head.1;
+    let (a, b, line_after) = if l1 + 1 < n {
+        ((l0, 0), (l1 + 1, 0), l0)
+    } else if l0 > 0 {
+        ((l0 - 1, doc.line(l0 - 1).len() as u32), (l1, doc.line(l1).len() as u32), l0 - 1)
+    } else {
+        ((0, 0), (l1, doc.line(l1).len() as u32), 0)
+    };
+    doc.group(Kind::Other, time, s, |tx| {
+        tx.edit(a, b, "");
+        Sel::caret(tx.doc.clamp((line_after, col)))
+    })
+}
+
+/// Swap the touched lines with the line above (`up`) or below. One edit.
+pub fn move_lines(doc: &mut Document, s: Sel, up: bool, time: f64) -> Option<Sel> {
+    let (l0, l1) = sel_lines(s);
+    if (up && l0 == 0) || (!up && l1 + 1 >= doc.line_count()) {
+        return None;
+    }
+    let block = doc.buf.slice((l0, 0), (l1, doc.line(l1).len() as u32));
+    let (a, b, text, d) = if up {
+        let prev = doc.line(l0 - 1);
+        ((l0 - 1, 0), (l1, doc.line(l1).len() as u32), format!("{block}\n{prev}"), -1)
+    } else {
+        let next = doc.line(l1 + 1);
+        ((l0, 0), (l1 + 1, next.len() as u32), format!("{next}\n{block}"), 1)
+    };
+    doc.group(Kind::Other, time, s, |tx| {
+        tx.edit(a, b, &text);
+        let t = shift_lines(s, d);
+        Sel { anchor: tx.doc.clamp(t.anchor), head: tx.doc.clamp(t.head) }
+    })
+}
+
 pub fn cut(doc: &mut Document, s: Sel, time: f64) -> Option<(String, Sel)> {
     let (a, b) = copy_range(doc, s);
     let whole = range(s).0 == range(s).1;
@@ -279,20 +338,6 @@ mod tests {
     }
 
     const SOFT: Tabs = Tabs { width: 4, soft: true };
-
-    #[test]
-    fn newline_auto_indent() {
-        let mut doc = d("    fn x() {");
-        let s = newline(&mut doc, Sel::caret((0, 12)), &SOFT, 0.0).unwrap();
-        assert_eq!(doc.text(), "    fn x() {\n        ");
-        assert_eq!(s.head, (1, 8));
-        let mut doc = d("\tif x:");
-        newline(&mut doc, Sel::caret((0, 6)), &Tabs { width: 4, soft: false }, 0.0);
-        assert_eq!(doc.text(), "\tif x:\n\t\t");
-        let mut doc = d("  ab");
-        newline(&mut doc, Sel::caret((0, 1)), &SOFT, 0.0);
-        assert_eq!(doc.text(), " \n  ab");
-    }
 
     #[test]
     fn backspace_variants() {
@@ -365,5 +410,39 @@ mod tests {
         assert_eq!((t.as_str(), doc.text().as_str(), s.head), ("b\n", "a\nc", (1, 0)));
         let (t, _) = cut(&mut doc, Sel::caret((1, 0)), 0.0).unwrap();
         assert_eq!((t.as_str(), doc.text().as_str()), ("c\n", "a"));
+        assert_eq!(copy_text(&d("x\ny"), Sel::caret((1, 0))), "y\n");
+        assert_eq!(copy_text(&d("x\ny"), Sel { anchor: (0, 0), head: (1, 1) }), "x\ny");
+    }
+
+    #[test]
+    fn line_ops() {
+        let mut doc = d("a\nb\nc");
+        let s = duplicate_lines(&mut doc, Sel::caret((1, 1)), true, 0.0).unwrap();
+        assert_eq!((doc.text().as_str(), s.head), ("a\nb\nb\nc", (2, 1)));
+        let s = duplicate_lines(&mut doc, Sel { anchor: (0, 0), head: (1, 1) }, false, 0.0).unwrap();
+        assert_eq!((doc.text().as_str(), s), ("a\nb\na\nb\nb\nc", Sel { anchor: (0, 0), head: (1, 1) }));
+        let mut doc = d("a\nb\nc\nd");
+        // Selection ending at col 0 of line 2: lines 0-1 move.
+        let s = move_lines(&mut doc, Sel { anchor: (0, 0), head: (2, 0) }, false, 0.0).unwrap();
+        assert_eq!((doc.text().as_str(), s), ("c\na\nb\nd", Sel { anchor: (1, 0), head: (3, 0) }));
+        let s = move_lines(&mut doc, s, true, 0.0).unwrap();
+        assert_eq!(doc.text(), "a\nb\nc\nd");
+        assert!(move_lines(&mut doc, s, true, 0.0).is_none(), "top line cannot move up");
+        assert!(move_lines(&mut doc, Sel::caret((3, 0)), false, 0.0).is_none());
+        let s = move_lines(&mut doc, Sel::caret((3, 1)), true, 0.0).unwrap();
+        assert_eq!((doc.text().as_str(), s.head), ("a\nb\nd\nc", (2, 1)));
+        let s = delete_lines(&mut doc, Sel::caret((1, 1)), 0.0).unwrap();
+        assert_eq!((doc.text().as_str(), s.head), ("a\nd\nc", (1, 1)));
+        let s = delete_lines(&mut doc, Sel { anchor: (1, 0), head: (2, 1) }, 0.0).unwrap();
+        assert_eq!((doc.text().as_str(), s.head), ("a", (0, 1)));
+        delete_lines(&mut doc, Sel::caret((0, 0)), 0.0).unwrap();
+        assert_eq!(doc.text(), "");
+        assert!(delete_lines(&mut doc, Sel::caret((0, 0)), 0.0).is_none(), "nothing left: no undo step");
+        let mut doc = d("x\ny");
+        doc.set_read_only(true);
+        assert!(duplicate_lines(&mut doc, Sel::caret((0, 0)), true, 0.0).is_none());
+        assert!(move_lines(&mut doc, Sel::caret((0, 0)), false, 0.0).is_none());
+        assert!(delete_lines(&mut doc, Sel::caret((0, 0)), 0.0).is_none());
+        assert_eq!(doc.text(), "x\ny");
     }
 }

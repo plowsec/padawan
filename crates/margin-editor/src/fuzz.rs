@@ -41,6 +41,7 @@ fn random_walk() {
         let start = rand_text(&mut r, 60);
         let mut d = Document::new(&start, Lang::Plain);
         assert_eq!(d.text(), start);
+        d.set_lang([Lang::Plain, Lang::Markdown, Lang::Rust, Lang::Python, Lang::Ruby, Lang::Lua][round % 6]);
         let norm = {
             let mut x = Document::new(&start, Lang::Plain);
             x.replace((0, 0), (0, 0), "");
@@ -51,10 +52,10 @@ fn random_walk() {
         let mut t = 0.0;
         for _ in 0..300 {
             t += if r.below(3) == 0 { 1.0 } else { 0.1 };
-            let op = r.below(14);
+            let op = r.below(18);
             let res = match op {
                 0 => ops::insert(&mut d, s, &rand_text(&mut r, 4), Kind::Type, t),
-                1 => ops::newline(&mut d, s, &tabs, t),
+                1 => crate::indent::newline(&mut d, s, &tabs, r.below(4) != 0, t),
                 2 => ops::backspace(&mut d, s, [Reach::Char, Reach::Word, Reach::Line][r.below(3)], &tabs, t),
                 3 => ops::delete(&mut d, s, [Reach::Char, Reach::Word, Reach::Line][r.below(3)], t),
                 4 => ops::tab(&mut d, s, &tabs, t),
@@ -91,7 +92,11 @@ fn random_walk() {
                 }
                 11 => Some(Sel { anchor: d.clamp(rand_pos(&mut r, &d)), head: d.clamp(rand_pos(&mut r, &d)) }),
                 12 => d.replace(rand_pos(&mut r, &d), rand_pos(&mut r, &d), &rand_text(&mut r, 3)).map(|e| Sel::caret(e.end)),
-                _ => ops::indent(&mut d, s, &tabs, t),
+                13 => ops::indent(&mut d, s, &tabs, t),
+                14 => crate::indent::closer(&mut d, s, ['}', ']', ')'][r.below(3)], &tabs, t).flatten(),
+                15 => ops::duplicate_lines(&mut d, s, r.below(2) == 0, t),
+                16 => ops::move_lines(&mut d, s, r.below(2) == 0, t),
+                _ => ops::delete_lines(&mut d, s, t),
             };
             if let Some(n) = res {
                 s = Sel { anchor: d.clamp(n.anchor), head: d.clamp(n.head) };

@@ -99,6 +99,40 @@ impl H {
         self.shot.ctx().read_response(id).map(|r| r.rect)
     }
 
+    /// Rect of an editor sub-widget by its id salt (as of the last frame).
+    pub fn rect_of(&self, salt: impl std::hash::Hash + std::fmt::Debug) -> Option<Rect> {
+        let id = self.editor_id?.with(salt);
+        self.shot.ctx().read_response(id).map(|r| r.rect)
+    }
+
+    /// Context menu row `i` (screen rect).
+    pub fn menu_row(&self, i: usize) -> Option<Rect> {
+        self.rect_of(("ctx-menu-row", i))
+    }
+
+    /// Secondary press + release at `at` (two frames), then one more frame (menu drawn and hit-testable).
+    pub fn right_click(&mut self, at: Pos2) {
+        self.shot.move_to([at.x, at.y]);
+        self.shot.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+        self.frame();
+        self.shot.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+        self.frames(2);
+    }
+
+    /// Queue an action and run one frame.
+    pub fn act(&mut self, a: margin_editor::EditAction) {
+        self.st.run(a);
+        self.frame();
+    }
+
+    pub fn png(&mut self, name: &str) {
+        let _ = std::fs::create_dir_all(SHOTS);
+        match self.shot.png(format!("{SHOTS}/{name}")) {
+            Err(margin_shot::ShotError::NoGpu(why)) => eprintln!("skip png: {why}"),
+            r => r.unwrap(),
+        }
+    }
+
     pub fn any_out(&self, f: impl Fn(&EditorOutput) -> bool) -> bool {
         self.outs.iter().any(f)
     }
@@ -110,4 +144,12 @@ pub fn cmd() -> Modifiers {
 
 pub fn shift() -> Modifiers {
     Modifiers::SHIFT
+}
+
+pub fn alt() -> Modifiers {
+    Modifiers::ALT
+}
+
+pub fn cmd_shift() -> Modifiers {
+    Modifiers { shift: true, ..Modifiers::COMMAND }
 }
