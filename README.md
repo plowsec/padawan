@@ -129,6 +129,7 @@ Nothing is written into an opened folder except the files you save.
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
 cargo run -p margin-gui --example app_shot -- /abs/out/dir     # screenshots of the main states
+scripts/sign.sh                                                # macOS: codesign target/release/margin (ad hoc; MARGIN_SIGN_ID="<identity>" for yours)
 MARGIN_SMOKE=1 target/debug/margin /abs/folder                 # start, index, print `smoke: ok …`, exit
 MARGIN_SMOKE=clipboard target/debug/margin /abs/folder         # same + copy/paste round trip (overwrites the clipboard)
 MARGIN_SMOKE=newwindow target/debug/margin /abs/folder         # same + a second window
