@@ -7,12 +7,14 @@
 //! | `outline` | functions of a file, with the calls each one makes and which calls are sinks |
 //! | `sink_kind` | is a call a dangerous sink (tables per language in `sinks.rs`) |
 //! | `Lang::ALL`, `LEX_LINE_CAP` | added: every variant; bytes of a line that get tokens |
+//! | `flow` | added: parameters, call arguments, heuristic taint by name (call paths) |
 //!
 //! Rules for every function here: never panic, never recurse on input depth, linear time,
 //! any byte sequence that is valid UTF-8 is acceptable input.
 //!
 //! PUBLIC API IS FROZEN (other crates compile against it). Add items if needed; do not change these.
 
+pub mod flow;
 mod lang;
 mod lex;
 mod outline;

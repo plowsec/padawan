@@ -21,7 +21,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 
 use crate::bloom;
-use crate::glob::GlobList;
+use crate::glob::FileFilter;
 use crate::index::{content_cap, FileRec};
 use crate::jail::{is_binary, open_regular, read_capped};
 use crate::snippet::make_site;
@@ -40,10 +40,11 @@ pub struct Plan {
     m: Matcher,
     /// Bloom prefilter.
     tris: Option<Vec<u32>>,
-    include: GlobList,
-    exclude: GlobList,
+    filter: FileFilter,
     max_hits: usize,
     empty: bool,
+    /// `query.regex`: `Replace` expands `$1` in the replacement.
+    expand: bool,
 }
 
 fn word_byte(b: u8) -> bool {
@@ -61,7 +62,7 @@ fn trim_msg(s: String) -> String {
     format!("{}…", &s[..cut])
 }
 
-fn build_re(pat: &str, ci: bool) -> Result<regex::bytes::Regex, (ErrCode, String)> {
+pub(crate) fn build_re(pat: &str, ci: bool) -> Result<regex::bytes::Regex, (ErrCode, String)> {
     regex::bytes::RegexBuilder::new(pat)
         .case_insensitive(ci)
         .multi_line(true)
@@ -74,8 +75,7 @@ fn build_re(pat: &str, ci: bool) -> Result<regex::bytes::Regex, (ErrCode, String
 
 pub fn plan(q: &SearchQuery) -> Result<Plan, (ErrCode, String)> {
     let max_hits = if q.max_hits == 0 { MAX_ITEMS } else { (q.max_hits as usize).min(MAX_ITEMS) };
-    let include = GlobList::parse(&q.include);
-    let exclude = GlobList::parse(&q.exclude);
+    let filter = FileFilter::parse(&q.include, &q.exclude);
     let empty = q.pattern.is_empty();
     let ci = !q.case_sensitive;
     let (m, tris) = if q.regex {
@@ -99,18 +99,13 @@ pub fn plan(q: &SearchQuery) -> Result<Plan, (ErrCode, String)> {
         };
         (m, tris)
     };
-    Ok(Plan { m, tris, include, exclude, max_hits, empty })
+    Ok(Plan { m, tris, filter, max_hits, empty, expand: q.regex })
 }
 
 impl Plan {
-    fn wants(&self, f: &FileRec) -> bool {
-        if !f.searchable() {
-            return false;
-        }
-        if !self.include.is_empty() && !self.include.matches_path(&f.path) {
-            return false;
-        }
-        if !self.exclude.is_empty() && self.exclude.matches_path(&f.path) {
+    /// Searchable, passes the filters, and the bloom does not rule it out.
+    pub(crate) fn wants(&self, f: &FileRec) -> bool {
+        if !f.searchable() || !self.filter.pass(&f.path) {
             return false;
         }
         match &self.tris {
@@ -120,7 +115,7 @@ impl Plan {
     }
 
     /// Match ranges in `data` (up to `cap`). `false` if cancelled.
-    fn matches(&self, data: &[u8], folded: &mut Vec<u8>, cap: usize, cancel: &AtomicBool, out: &mut Vec<(usize, usize)>) -> bool {
+    pub(crate) fn matches(&self, data: &[u8], folded: &mut Vec<u8>, cap: usize, cancel: &AtomicBool, out: &mut Vec<(usize, usize)>) -> bool {
         match &self.m {
             Matcher::Lit { finder, fold, word, len, first_word, last_word } => {
                 let hay: &[u8] = if *fold {
@@ -169,6 +164,50 @@ impl Plan {
             }
         }
         true
+    }
+
+    /// `data` with every match replaced → (new data, matches). `None` if cancelled.
+    /// Regex query: `$1` / `${name}` / `$$` expand. Otherwise (also the regex a non-ASCII
+    /// case-insensitive literal compiles to) `rep` is literal. Empty matches are left alone.
+    pub(crate) fn replace(&self, data: &[u8], rep: &[u8], cancel: &AtomicBool) -> Option<(Vec<u8>, u32)> {
+        let mut out = Vec::with_capacity(data.len());
+        let mut last = 0usize;
+        let mut n = 0u32;
+        match &self.m {
+            Matcher::Re(re) if self.expand => {
+                for (k, caps) in re.captures_iter(data).enumerate() {
+                    if k % 1024 == 1023 && cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    let Some(m) = caps.get(0) else { continue };
+                    if m.start() == m.end() || m.start() < last {
+                        continue;
+                    }
+                    out.extend_from_slice(data.get(last..m.start()).unwrap_or_default());
+                    caps.expand(rep, &mut out);
+                    last = m.end();
+                    n = n.saturating_add(1);
+                }
+            }
+            _ => {
+                let mut ranges = Vec::new();
+                let mut folded = Vec::new();
+                if !self.matches(data, &mut folded, usize::MAX, cancel, &mut ranges) {
+                    return None;
+                }
+                for (s, e) in ranges {
+                    if s < last || e <= s {
+                        continue;
+                    }
+                    out.extend_from_slice(data.get(last..s).unwrap_or_default());
+                    out.extend_from_slice(rep);
+                    last = e;
+                    n = n.saturating_add(1);
+                }
+            }
+        }
+        out.extend_from_slice(data.get(last..).unwrap_or_default());
+        Some((out, n))
     }
 }
 

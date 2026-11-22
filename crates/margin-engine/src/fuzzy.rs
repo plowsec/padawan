@@ -16,9 +16,11 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use margin_proto::limits::MAX_ITEMS;
 use margin_proto::{FileMatch, RelPath};
 use rayon::prelude::*;
 
+use crate::glob::{FileFilter, PathGlob};
 use crate::index::FileRec;
 
 const MATCH: i32 = 16;
@@ -207,6 +209,41 @@ fn top_k(mut v: Vec<(i32, u32)>, k: usize, files: &[Arc<FileRec>]) -> Vec<(i32, 
     v
 }
 
+/// `FindFiles`: `filter` first, then by query (see `Request::FindFiles`). `limit` clamped to `1..=MAX_ITEMS`.
+///
+/// | Query | Result |
+/// |---|---|
+/// | empty | every file passing the filter, by path |
+/// | glob (`*?[{`) | `PathGlob` on the path (name alone without `/`), by path, no positions |
+/// | else | fuzzy, best first |
+pub fn find_files(pool: &rayon::ThreadPool, files: &[Arc<FileRec>], query: &str, filter: &FileFilter, limit: usize) -> Vec<FileMatch> {
+    let k = limit.clamp(1, MAX_ITEMS);
+    let pass = |f: &FileRec| filter.is_empty() || filter.pass(&f.path);
+    if query.trim().is_empty() || PathGlob::is_glob(query) {
+        let glob = PathGlob::is_glob(query).then(|| PathGlob::parse(query));
+        let hits: Vec<Vec<&Arc<FileRec>>> = pool.install(|| {
+            files
+                .par_chunks(CHUNK)
+                .map(|chunk| {
+                    let mut comps = Vec::new();
+                    let mut v = Vec::new();
+                    for f in chunk {
+                        if v.len() >= k {
+                            break;
+                        }
+                        if pass(f) && glob.as_ref().is_none_or(|g| g.matches(&f.path, &mut comps)) {
+                            v.push(f);
+                        }
+                    }
+                    v
+                })
+                .collect()
+        });
+        return hits.into_iter().flatten().take(k).filter_map(|f| mk(f, 0, Vec::new())).collect();
+    }
+    find_by(pool, files, &Query::new(query), k, &pass)
+}
+
 /// Top `limit` matches (clamped to 1000). Empty query: most recently modified first.
 pub fn find(pool: &rayon::ThreadPool, files: &[Arc<FileRec>], query: &str, limit: u32) -> Vec<FileMatch> {
     let k = (limit as usize).clamp(1, MAX_LIMIT);
@@ -224,6 +261,14 @@ pub fn find(pool: &rayon::ThreadPool, files: &[Arc<FileRec>], query: &str, limit
         idx.sort_unstable_by(cmp);
         return idx.into_iter().filter_map(|i| mk(&files[i as usize], 0, Vec::new())).collect();
     }
+    find_by(pool, files, &q, k, &|_| true)
+}
+
+/// Fuzzy top `k` among the files `keep` accepts.
+fn find_by(pool: &rayon::ThreadPool, files: &[Arc<FileRec>], q: &Query, k: usize, keep: &(dyn Fn(&FileRec) -> bool + Sync)) -> Vec<FileMatch> {
+    if q.is_empty() {
+        return Vec::new();
+    }
     let hits: Vec<(i32, u32)> = pool.install(|| {
         files
             .par_chunks(CHUNK)
@@ -233,7 +278,8 @@ pub fn find(pool: &rayon::ThreadPool, files: &[Arc<FileRec>], query: &str, limit
                 let v: Vec<(i32, u32)> = chunk
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, f)| score(&q, &f.path, &mut pos).map(|s| (s, (c * CHUNK + i) as u32)))
+                    .filter(|(_, f)| keep(f))
+                    .filter_map(|(i, f)| score(q, &f.path, &mut pos).map(|s| (s, (c * CHUNK + i) as u32)))
                     .collect();
                 top_k(v, k, files)
             })
@@ -248,7 +294,7 @@ pub fn find(pool: &rayon::ThreadPool, files: &[Arc<FileRec>], query: &str, limit
     hits.into_iter()
         .filter_map(|(s, i)| {
             let f = &files[i as usize];
-            score(&q, &f.path, &mut pos)?;
+            score(q, &f.path, &mut pos)?;
             mk(f, s, pos.clone())
         })
         .collect()

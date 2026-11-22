@@ -100,6 +100,22 @@ pub fn sink_code(k: Option<SinkKind>) -> u8 {
     }
 }
 
+/// Inverse of `sink_code`.
+pub fn sink_of(code: u8) -> Option<SinkKind> {
+    Some(match code {
+        1 => SinkKind::Exec,
+        2 => SinkKind::Memory,
+        3 => SinkKind::Eval,
+        4 => SinkKind::Deserialize,
+        5 => SinkKind::Sql,
+        6 => SinkKind::File,
+        7 => SinkKind::Format,
+        8 => SinkKind::Network,
+        9 => SinkKind::Html,
+        _ => return None,
+    })
+}
+
 /// Read cap for indexing and search.
 pub fn content_cap(max_file_bytes: u64) -> usize {
     usize::try_from(max_file_bytes).unwrap_or(usize::MAX).min(MAX_OPEN_FILE)

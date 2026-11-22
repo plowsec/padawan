@@ -6,7 +6,7 @@
 //! | `sites` | call sites of a callee `(file, line, col, caller)` |
 //! | `edges` | distinct callee names of a function name (all its definitions merged) |
 //! | `sinks` | direct sink calls of a function name `(sink name, count)` |
-//! | `sink_sites` | the sink call sites, by caller |
+//! | `sink_sites` | the sink call sites, by caller, with the sink code |
 //!
 //! Reach: BFS over names, depth ≤ 8, ≤ 5_000 visited; top 32 sinks cached per name until the graph is rebuilt.
 //! A lens row merges the cached tops of its callees (approximate order only when a callee reaches > 32 sinks).
@@ -131,7 +131,7 @@ pub struct Graph {
     sites: Csr<CallLoc>,
     edges: Csr<u32>,
     sinks: Csr<(u32, u32)>,
-    sink_sites: Csr<CallLoc>,
+    sink_sites: Csr<(CallLoc, u8)>,
     pub symbols: u32,
     /// Definitions + call sites (rebuild cost).
     pub size: usize,
@@ -157,6 +157,14 @@ pub struct ReachSite {
     pub sink_len: u32,
 }
 
+/// A call chain to one sink call site: `hops[k]` is a call inside function k; the last one is the sink call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawPath {
+    pub hops: Vec<CallLoc>,
+    /// `index::sink_code` of the sink.
+    pub kind: u8,
+}
+
 impl Graph {
     pub fn build(files: &[Arc<FileRec>]) -> Graph {
         let mut g = Graph::default();
@@ -164,7 +172,7 @@ impl Graph {
         let mut sites: Vec<(u32, CallLoc)> = Vec::new();
         let mut edges: Vec<(u32, u32)> = Vec::new();
         let mut sinks: Vec<(u32, u32)> = Vec::new();
-        let mut sink_sites: Vec<(u32, CallLoc)> = Vec::new();
+        let mut sink_sites: Vec<(u32, (CallLoc, u8))> = Vec::new();
         for f in files.iter().filter(|f| !f.fns.is_empty()) {
             let file = g.paths.len() as u32;
             g.paths.push(f.path.clone());
@@ -177,7 +185,7 @@ impl Graph {
                     sites.push((callee, cl));
                     if c.sink != 0 {
                         sinks.push((caller, callee));
-                        sink_sites.push((caller, cl));
+                        sink_sites.push((caller, (cl, c.sink)));
                     } else {
                         edges.push((caller, callee));
                     }
@@ -343,7 +351,7 @@ impl Graph {
             let sites = self.sink_sites.row(v);
             if !sites.is_empty() {
                 let chain = self.chain(v, &parent);
-                for s in sites {
+                for (s, _) in sites {
                     if out.len() >= cap {
                         return out;
                     }
@@ -365,6 +373,95 @@ impl Graph {
             }
         }
         out
+    }
+
+    /// Shortest call chain from `name` to each sink call site (BFS as `reach_sites`), in BFS order.
+    /// `sink` non-empty: only that sink. Each path: one site per hop, the last is the sink call.
+    /// At most `cap`; `true` when more existed.
+    pub fn sink_paths(&self, name: &str, sink: &str, cap: usize) -> (Vec<RawPath>, bool) {
+        let Some(id) = self.id(name) else { return (Vec::new(), false) };
+        let want = if sink.is_empty() {
+            None
+        } else {
+            match self.id(sink) {
+                Some(s) => Some(s),
+                None => return (Vec::new(), false),
+            }
+        };
+        let mut parent: IdMap<u32> = IdMap::default();
+        let mut q: VecDeque<(u32, u32)> = VecDeque::new();
+        let mut edge_memo: HashMap<(u32, u32), Option<CallLoc>> = HashMap::new();
+        parent.insert(id, id);
+        q.push_back((id, 0));
+        let mut out = Vec::new();
+        while let Some((v, d)) = q.pop_front() {
+            let sites = self.sink_sites.row(v);
+            if sites.iter().any(|(s, _)| want.is_none_or(|w| s.callee == w)) {
+                let nodes = self.chain_ids(v, &parent);
+                let mut prefix = Vec::with_capacity(nodes.len());
+                let mut ok = true;
+                for w in nodes.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let e = *edge_memo.entry((a, b)).or_insert_with(|| self.first_site(a, b));
+                    match e {
+                        Some(c) => prefix.push(c),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && prefix.len() < margin_proto::limits::MAX_HOPS {
+                    for &(s, kind) in sites.iter().filter(|(s, _)| want.is_none_or(|w| s.callee == w)) {
+                        if out.len() >= cap {
+                            return (out, true);
+                        }
+                        let mut hops = prefix.clone();
+                        hops.push(s);
+                        out.push(RawPath { hops, kind });
+                    }
+                }
+            }
+            if d >= MAX_DEPTH {
+                continue;
+            }
+            for &w in self.edges.row(v) {
+                if parent.len() >= MAX_VISITED {
+                    break;
+                }
+                if self.defined(w) && !parent.contains_key(&w) {
+                    parent.insert(w, v);
+                    q.push_back((w, d + 1));
+                }
+            }
+        }
+        (out, false)
+    }
+
+    /// First call of `callee` inside `caller`, in source order (path, line, col).
+    fn first_site(&self, caller: u32, callee: u32) -> Option<CallLoc> {
+        self.sites
+            .row(callee)
+            .iter()
+            .filter(|c| c.caller == caller)
+            .min_by(|a, b| self.path(a.at.file).cmp(self.path(b.at.file)).then(a.at.line.cmp(&b.at.line)).then(a.at.col.cmp(&b.at.col)))
+            .copied()
+    }
+
+    /// Names from the BFS root to `v`.
+    fn chain_ids(&self, mut v: u32, parent: &IdMap<u32>) -> Vec<u32> {
+        let mut ids = vec![v];
+        for _ in 0..=MAX_DEPTH {
+            match parent.get(&v) {
+                Some(&p) if p != v => {
+                    ids.push(p);
+                    v = p;
+                }
+                _ => break,
+            }
+        }
+        ids.reverse();
+        ids
     }
 
     fn chain(&self, mut v: u32, parent: &IdMap<u32>) -> String {
@@ -448,6 +545,27 @@ mod tests {
         assert!(chains.contains(&"main → handler → run_cmd → system"), "{chains:?}");
         assert!(chains.contains(&"main → handler → parse → memcpy"), "{chains:?}");
         assert_eq!(g.reach_sites("main", 2).len(), 2);
+    }
+
+    #[test]
+    fn sink_paths_shortest_per_site() {
+        let g = sample();
+        let (p, more) = g.sink_paths("main", "", 100);
+        assert!(!more);
+        let chain = |r: &RawPath| r.hops.iter().map(|h| format!("{}>{}", g.name(h.caller), g.name(h.callee))).collect::<Vec<_>>().join(" ");
+        let all: Vec<String> = p.iter().map(chain).collect();
+        assert!(all.contains(&"main>handler handler>strcpy".to_owned()), "{all:?}");
+        assert!(all.contains(&"main>handler handler>run_cmd run_cmd>system".to_owned()), "{all:?}");
+        assert_eq!(all.iter().filter(|c| c.ends_with("parse>memcpy")).count(), 2, "one per sink site");
+        let (p, _) = g.sink_paths("main", "system", 100);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].hops.last().map(|h| h.at.line), Some(11));
+        assert_eq!(g.sink_paths("main", "nope", 100).0.len(), 0);
+        let (p, more) = g.sink_paths("main", "", 1);
+        assert!(more && p.len() == 1);
+        // Direct sink: one hop.
+        let (p, _) = g.sink_paths("handler", "strcpy", 10);
+        assert_eq!(p[0].hops.len(), 1);
     }
 
     #[test]

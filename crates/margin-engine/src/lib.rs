@@ -12,7 +12,9 @@
 //! | `index`, `bloom` | per-file record: flags, trigram bloom, outline summary |
 //! | `fuzzy` | `FindFiles` |
 //! | `search`, `snippet` | content search, `Site` windows |
-//! | `graph` | call graph: lens, callers, defs, reach |
+//! | `graph` | call graph: lens, callers, defs, reach, sink paths |
+//! | `paths` | `Paths`: call chains + argument flow |
+//! | `replace` | `Replace` |
 //! | `cache` | on-disk index cache |
 //! | `service` | request loop, pools, events, incremental updates |
 
@@ -29,6 +31,8 @@ pub mod graph;
 pub mod ignore;
 pub mod index;
 pub mod jail;
+pub mod paths;
+pub mod replace;
 pub mod search;
 pub mod service;
 pub mod snippet;

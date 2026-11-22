@@ -154,6 +154,12 @@ fn main() {
         let r = fuzzy::find(&pool, &big, q, 50);
         eprintln!("fuzzy {q:?} on {}: {} hits, {}", big.len(), r.len(), ms(t.elapsed()));
     }
+    for (q, inc) in [("*.rs", ""), ("src/**/*.{rs,toml}", ""), ("", "*.md, !copy1/**"), ("main", "!copy2/**")] {
+        let f = margin_engine::glob::FileFilter::parse(inc, "");
+        let t = Instant::now();
+        let r = fuzzy::find_files(&pool, &big, q, &f, 100_000);
+        eprintln!("find_files {q:?} include {inc:?} on {}: {} hits, {}", big.len(), r.len(), ms(t.elapsed()));
+    }
 
     // Graph: synthetic outlines (margin-code may still return none), 200k files x 10 fns x 10 calls.
     {

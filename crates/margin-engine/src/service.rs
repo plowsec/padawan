@@ -4,7 +4,7 @@
 //! |---|---|
 //! | caller of `run` | request loop: dispatch only, never slow work |
 //! | `io` pool (4) | ListDir, ReadFile, WriteFile, CreateDir, Rename, Delete, Stat |
-//! | `query` pool (`threads`) | FindFiles, Search, Lens, Callers, Defs, Reach |
+//! | `query` pool (`threads`) | FindFiles, Search, Lens, Callers, Defs, Reach, Paths, Replace |
 //! | `index` thread + pool (`threads`) | walk, index, cache; rescans coalesced |
 //! | `graph` thread | rebuilds a big call graph (> 300k defs + calls) after a save; smaller ones rebuild inline |
 //!
@@ -395,22 +395,31 @@ fn wanted(sh: &Shared, rel: &RelPath, opts: &IndexOpts) -> bool {
 
 /// Re-index one path after a file operation.
 fn refresh(sh: &Shared, rel: &RelPath) {
+    refresh_many(sh, std::slice::from_ref(rel));
+}
+
+/// Re-index several paths with one snapshot swap (one graph rebuild).
+fn refresh_many(sh: &Shared, rels: &[RelPath]) {
     let opts = sh.opts();
+    let ups: Vec<Update> = rels.iter().map(|r| refresh_update(sh, r, &opts)).collect();
+    update_many(sh, ups);
+    if rels.iter().any(|r| r.name() == ".gitignore") {
+        sh.rescan();
+    }
+}
+
+fn refresh_update(sh: &Shared, rel: &RelPath, opts: &IndexOpts) -> Update {
     let lex = sh.jail.lexical(rel);
     let regular = std::fs::symlink_metadata(&lex).is_ok_and(|m| m.is_file());
     // No symlinked directory on the way (the walker would not have entered it).
     let plain = std::fs::canonicalize(&lex).is_ok_and(|c| c == lex);
-    if regular && plain && wanted(sh, rel, &opts) {
+    if regular && plain && wanted(sh, rel, opts) {
         let md = std::fs::symlink_metadata(&lex).ok();
         let (size, mt) = md.map_or((0, 0), |m| (m.len(), crate::jail::mtime_ns(&m)));
         let mut buf = Vec::new();
-        let rec = index_file(&lex, rel.as_str(), size, mt, opts.max_file_bytes, &mut buf);
-        update(sh, Update::Put(Arc::new(rec)));
+        Update::Put(Arc::new(index_file(&lex, rel.as_str(), size, mt, opts.max_file_bytes, &mut buf)))
     } else {
-        update(sh, Update::Remove(rel.as_str().into()));
-    }
-    if rel.name() == ".gitignore" {
-        sh.rescan();
+        Update::Remove(rel.as_str().into())
     }
 }
 
@@ -447,19 +456,32 @@ fn apply(files: &mut Vec<Arc<FileRec>>, u: &Update) -> bool {
 
 /// Apply one update to the live snapshot (and log it for a running rescan).
 fn update(sh: &Shared, u: Update) {
+    update_many(sh, vec![u]);
+}
+
+/// Apply updates in order, as one snapshot swap.
+fn update_many(sh: &Shared, ups: Vec<Update>) {
+    if ups.is_empty() {
+        return;
+    }
     let mut cur = {
         let Ok(mut st) = sh.state.lock() else { return };
-        st.seq += 1;
-        let seq = st.seq;
-        if st.rescanning {
-            st.log.push((seq, u.clone()));
+        for u in &ups {
+            st.seq += 1;
+            let seq = st.seq;
+            if st.rescanning {
+                st.log.push((seq, u.clone()));
+            }
         }
         st.dirty = true;
         st.snap.clone()
     };
     loop {
         let mut files = (*cur.files).clone();
-        let regraph = apply(&mut files, &u);
+        let mut regraph = false;
+        for u in &ups {
+            regraph |= apply(&mut files, u);
+        }
         let sync = regraph && cur.graph.size < SYNC_GRAPH;
         let graph = if sync { Arc::new(Graph::build(&files)) } else { cur.graph.clone() };
         let next = Arc::new(Snapshot { files: Arc::new(files), graph, max_file_bytes: cur.max_file_bytes, ready: cur.ready });
@@ -722,9 +744,27 @@ fn clamp_limit(limit: u32) -> usize {
 fn query_op(sh: &Shared, id: ReqId, req: Request, cancel: &AtomicBool) {
     let snap = sh.snap();
     match req {
-        Request::FindFiles { query, limit, .. } => {
-            let items = crate::fuzzy::find(&sh.query, &snap.files, &query, limit);
+        Request::FindFiles { query, include, exclude, limit } => {
+            let filter = crate::glob::FileFilter::parse(&include, &exclude);
+            let items = crate::fuzzy::find_files(&sh.query, &snap.files, &query, &filter, clamp_limit(limit));
             sh.reply(id, Reply::FileMatches { items, total_files: u32::try_from(snap.files.len()).unwrap_or(u32::MAX) });
+        }
+        Request::Replace { query, replacement, only, skip } => {
+            match crate::replace::run(&sh.query, &sh.jail, &snap.files, &query, &replacement, &only, &skip, snap.max_file_bytes, cancel) {
+                Ok(mut o) => {
+                    // Index as after `WriteFile`, every rewritten file, one swap.
+                    refresh_many(sh, &o.changed);
+                    o.changed.truncate(MAX_ITEMS);
+                    sh.reply(id, Reply::Replaced { files: o.files, replacements: o.replacements, changed: o.changed, skipped: o.skipped, cancelled: o.cancelled });
+                }
+                Err((c, m)) => sh.reply(id, err(c, m)),
+            }
+        }
+        Request::Paths { name, sink, limit } => {
+            match crate::paths::run(&sh.query, &sh.jail, &snap.graph, &name, &sink, limit, content_cap(snap.max_file_bytes), cancel) {
+                Ok((paths, truncated)) => sh.reply(id, Reply::Paths { paths, truncated }),
+                Err(code) => sh.reply(id, err(code, "cancelled")),
+            }
         }
         Request::Search { query } => {
             let plan = match crate::search::plan(&query) {
