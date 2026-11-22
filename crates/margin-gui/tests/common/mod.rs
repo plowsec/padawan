@@ -62,7 +62,7 @@ impl H {
         }
         let shot = Shot::new(size, ppp);
         margin_theme::fonts::install(shot.ctx());
-        let opts = RunOpts { opener: Box::new(FakeOpener::new(fake.clone())), folder: folder.map(PathBuf::from), file: None, config_dir: Some(cfg.path().to_path_buf()), gui_sandbox: "seatbelt".into() };
+        let opts = RunOpts { opener: Box::new(FakeOpener::new(fake.clone())), folder: folder.map(PathBuf::from), file: None, config_dir: Some(cfg.path().to_path_buf()), gui_sandbox: "seatbelt".into(), fresh: false };
         let app = App::new(shot.ctx(), opts);
         let mut h = H { shot, app, fake, cfg };
         h.frames(2);

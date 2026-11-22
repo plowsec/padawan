@@ -24,6 +24,7 @@ pub fn spawn(folder: Option<&Path>, no_sandbox: bool) -> Result<(), String> {
     }
     let exe = std::env::current_exe().map_err(|e| format!("cannot find my own binary: {e}"))?;
     let mut cmd = Command::new(exe);
+    cmd.arg("--fresh");
     if no_sandbox {
         cmd.arg("--no-sandbox");
     }

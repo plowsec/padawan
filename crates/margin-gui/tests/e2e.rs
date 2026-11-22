@@ -66,7 +66,7 @@ fn real_engine_open_edit_save_search() {
     let shot = Shot::new([1280.0, 820.0], 1.0);
     margin_theme::fonts::install(shot.ctx());
     let root: PathBuf = proj.path().to_path_buf();
-    let opts = RunOpts { opener: Box::new(LocalOpener), folder: Some(root.clone()), file: None, config_dir: Some(cfg.path().to_path_buf()), gui_sandbox: "none".into() };
+    let opts = RunOpts { opener: Box::new(LocalOpener), folder: Some(root.clone()), file: None, config_dir: Some(cfg.path().to_path_buf()), gui_sandbox: "none".into(), fresh: false };
     let app = App::new(shot.ctx(), opts);
     let mut e = E { shot, app };
     let p = e.until("tree", |p| p.folder.is_some() && p.tree.len() == 2);

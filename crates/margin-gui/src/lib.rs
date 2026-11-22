@@ -59,6 +59,8 @@ pub struct RunOpts {
     pub config_dir: Option<PathBuf>,
     /// What confines this GUI process, for the status bar: `"seatbelt"`, `"none"`.
     pub gui_sandbox: String,
+    /// A secondary window ("New Window"): do not restore untitled buffers or the last session.
+    pub fresh: bool,
 }
 
 struct Shell(App);

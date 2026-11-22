@@ -20,6 +20,7 @@ pub fn run_gui(args: &Args) -> Result<(), String> {
         file: args.file.clone(),
         config_dir: args.dir.clone(),
         gui_sandbox: args.sandbox.clone(),
+        fresh: args.fresh,
     })
 }
 

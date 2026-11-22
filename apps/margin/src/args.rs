@@ -28,6 +28,8 @@ pub struct Args {
     pub folder: Option<PathBuf>,
     /// Gui: file inside the folder, relative.
     pub file: Option<String>,
+    /// Secondary window: the GUI restores no untitled buffers and no last session.
+    pub fresh: bool,
     /// Gui: config dir. Worker: cache dir.
     pub dir: Option<PathBuf>,
     /// Gui: name of the sandbox it runs in, for the status bar. Probe: which profile it is under (`gui` / `worker`).
@@ -47,6 +49,7 @@ impl Args {
             path: None,
             folder: None,
             file: None,
+            fresh: false,
             dir: None,
             sandbox: "none".into(),
             outside: None,
@@ -70,6 +73,7 @@ impl Args {
                 "--help" => a.role = Role::Help,
                 "--version" => a.role = Role::Version,
                 "--no-sandbox" => a.no_sandbox = true,
+                "--fresh" => a.fresh = true,
                 "--check-sandbox" => a.role = Role::Check,
                 "--role" => {
                     a.role = match value("--role")?.to_string_lossy().as_ref() {

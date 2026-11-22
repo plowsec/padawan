@@ -48,6 +48,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             file,
             config_dir: config,
             gui_sandbox: "none".into(),
+            fresh: args.fresh,
         });
     }
 
@@ -70,6 +71,9 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
     if let Some(f) = &file {
         cmd.arg("--file").arg(f);
+    }
+    if args.fresh {
+        cmd.arg("--fresh");
     }
     let mut gui = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().map_err(|e| format!("cannot start the window process: {e}"))?;
     let mut from_gui = gui.stdout.take().ok_or("no pipe from the window process")?;
