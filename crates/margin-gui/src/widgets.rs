@@ -19,27 +19,9 @@ use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Galley, Id, Painter, Pos2, Rect, Response, Sense, Stroke, Ui};
 use margin_theme::Theme;
 
-/// `Theme::apply` without its dark-mode `u8` overflow (`130 * 3 / 4` panics in debug builds):
-/// style as Light (same colours: they come from `t`), then restore the dark-only bits.
+/// Install the theme. Cheap when unchanged: called every frame.
 pub fn apply_theme(ctx: &egui::Context, t: &Theme) {
-    let id = Id::unique("margin-gui-theme");
-    if ctx.data(|d| d.get_temp::<Theme>(id)) == Some(*t) {
-        return;
-    }
-    let mut light = *t;
-    light.mode = margin_theme::Mode::Light;
-    let dark = t.mode == margin_theme::Mode::Dark;
-    ctx.all_styles_mut(move |s| {
-        light.style_into(s);
-        if dark {
-            s.visuals.dark_mode = true;
-            s.visuals.window_shadow.color = Color32::from_black_alpha(130);
-            s.visuals.popup_shadow.color = Color32::from_black_alpha(97);
-        }
-    });
-    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
-    let t = *t;
-    ctx.data_mut(|d| d.insert_temp(id, t));
+    t.apply(ctx);
 }
 
 /// One line, truncated at `max_w` with `…`.

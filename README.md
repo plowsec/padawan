@@ -13,6 +13,13 @@ margin --check-sandbox                    # try to break out of both sandboxes, 
 margin --no-sandbox /abs/folder           # one process, no OS sandbox (debugging, non-macOS)
 ```
 
+## Status
+
+| Platform | State |
+|---|---|
+| macOS | built and tested; both sandboxes on (`margin --check-sandbox`) |
+| Linux, Windows | not built or tested yet; no OS sandbox (in-process checks only) |
+
 ## Keys
 
 `cmd` = Cmd on macOS, Ctrl elsewhere.
@@ -24,10 +31,13 @@ margin --no-sandbox /abs/folder           # one process, no OS sandbox (debuggin
 | `cmd+o` | open folder |
 | `cmd+shift+f` | search in folder (text or regex, globs) |
 | `cmd+f`, `cmd+alt+f` | find, replace in file |
+| `cmd+g` / `f3`, with `shift` | find next, previous (`f3` only off macOS) |
 | `cmd+s`, `cmd+w`, `cmd+n` | save, close tab, new file |
 | `f12` / cmd+click | go to definition |
 | `shift+f12` | callers of the word under the cursor |
-| `ctrl+g` | go to line |
+| `ctrl+g`, `cmd+shift+o` | go to line, go to function in file |
+| `ctrl+-`, `ctrl+shift+-` | back, forward (`alt+←` / `alt+→` off macOS) |
+| `ctrl+tab`, `ctrl+shift+tab` | next, previous tab |
 | `cmd+b` | sidebar |
 | `cmd+,` | settings (theme, accent, font sizes, line height, wrap, hints, index) |
 | `cmd+=` `cmd+-` `cmd+0` | zoom |
@@ -77,6 +87,7 @@ Nothing is written into an opened folder except the files you save.
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
 cargo run -p margin-gui --example app_shot -- /abs/out/dir     # screenshots of the main states
+MARGIN_SMOKE=1 target/debug/margin /abs/folder                 # start, index, print `smoke: ok …`, exit
 ```
 
 | Rule | Detail |
