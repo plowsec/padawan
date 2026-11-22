@@ -17,6 +17,7 @@ pub mod local;
 pub mod mux_client;
 pub mod probe;
 pub mod sandbox;
+pub mod window;
 pub mod worker;
 
 use std::io::Write as _;

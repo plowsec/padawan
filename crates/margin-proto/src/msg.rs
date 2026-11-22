@@ -3,7 +3,7 @@
 //! Conventions: lines are 0-based; columns and lengths are byte offsets in the line's UTF-8;
 //! times are nanoseconds since the Unix epoch; every list is capped (`limits`).
 
-use crate::limits::{MAX_DIR_ENTRIES, MAX_ITEMS, MAX_NAME, MAX_OPEN_FILE, MAX_SNIPPET, MAX_TEXT};
+use crate::limits::{MAX_ARGS, MAX_ARG_TEXT, MAX_DIR_ENTRIES, MAX_HOPS, MAX_ITEMS, MAX_NAME, MAX_OPEN_FILE, MAX_SNIPPET, MAX_TEXT};
 use crate::path::RelPath;
 use crate::wire::{Dec, Enc, WireError, WireResult};
 
@@ -66,8 +66,16 @@ pub enum Request {
     Delete { path: RelPath },
     /// → `Meta`.
     Stat { path: RelPath },
-    /// Fuzzy match on relative paths → `FileMatches`, best first. Empty query: most recently indexed first.
-    FindFiles { query: String, limit: u32 },
+    /// File-name search → `FileMatches`.
+    ///
+    /// | `query` | Match | Order |
+    /// |---|---|---|
+    /// | empty | every file | by path |
+    /// | has `*`, `?`, `[` or `{` | glob on the relative path (on the name alone when it has no `/`) | by path |
+    /// | else | fuzzy on the relative path | best first |
+    ///
+    /// `include` / `exclude`: comma-separated globs like `SearchQuery`; a file must pass both. `!glob` in `include` excludes.
+    FindFiles { query: String, include: String, exclude: String, limit: u32 },
     /// Content search → zero or more `SearchBatch`, then one `SearchDone` (or `Err`).
     Search { query: SearchQuery },
     /// Stop request `target`. Its stream ends with `Err(Cancelled)` or its normal end. No reply to the cancel itself.
@@ -81,6 +89,20 @@ pub enum Request {
     /// Sinks reachable from function `name` through calls → `Sites`
     /// (one per sink call site; `context` = call chain `a → b → memcpy`).
     Reach { name: String, limit: u32 },
+    /// Call paths from function `name` to sink call sites → `Paths`. Shortest path per sink site.
+    /// `sink`: only this sink name; empty = every sink. Direct sink calls in `name` are paths of one hop.
+    Paths { name: String, sink: String, limit: u32 },
+    /// Replace every match of `query` → `Replaced`. Same matching and file filters as `Search`.
+    ///
+    /// | Field | Meaning |
+    /// |---|---|
+    /// | `replacement` | literal text; with `query.regex`: `$1`, `${name}`, `$$` expand (Rust `regex` syntax) |
+    /// | `only` | non-empty: just these files |
+    /// | `skip` | never touch these (unsaved in the editor) |
+    ///
+    /// Each file is rewritten atomically; one that changed while being processed is skipped and reported.
+    /// Cancellable: files already rewritten stay rewritten. `query.max_hits` does not apply.
+    Replace { query: SearchQuery, replacement: String, only: Vec<RelPath>, skip: Vec<RelPath> },
     /// Re-scan the folder (changed files only) with these options. Progress comes as `Event::Index`. → `Done` at once.
     Reindex { opts: IndexOpts },
     /// Engine exits. No reply.
@@ -177,6 +199,46 @@ pub struct LensInfo {
     pub reach_more: bool,
 }
 
+/// One argument of a call on a path, with the inputs that flow into it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlowArg {
+    /// Source text of the argument, at most `MAX_ARG_TEXT` bytes.
+    pub text: String,
+    /// Names of the tracked inputs of the enclosing function found in this argument, directly or through
+    /// local assignments. First hop: every parameter is tracked. Later hops: only the parameters that
+    /// received a tracked argument from the hop before. Empty: nothing tracked reaches it.
+    pub from: Vec<String>,
+}
+
+/// One call on a path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hop {
+    /// The call site. `context` = function containing the call.
+    pub site: Site,
+    /// Arguments of the call, in order (at most `MAX_ARGS`). Empty when they could not be read.
+    pub args: Vec<FlowArg>,
+}
+
+/// A call chain from a function to a sink call, with heuristic argument flow.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallPath {
+    /// Sink name (`memcpy`).
+    pub sink: String,
+    /// Sink class label (`memory`, `exec`, …).
+    pub kind: String,
+    /// Calls in order; the last one is the sink call. At most `MAX_HOPS`.
+    pub hops: Vec<Hop>,
+    /// At least one argument of the sink call is fed by a parameter of the first function, through every hop.
+    pub flows: bool,
+}
+
+/// A file `Replace` left alone, and why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Skipped {
+    pub path: RelPath,
+    pub why: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
     Err { code: ErrCode, msg: String },
@@ -190,6 +252,9 @@ pub enum Reply {
     SearchDone(SearchStats),
     Lens { fns: Vec<LensInfo> },
     Sites { sites: Vec<Site>, truncated: bool },
+    Paths { paths: Vec<CallPath>, truncated: bool },
+    /// `changed`: files rewritten (at most `MAX_ITEMS`; `files` is the true count).
+    Replaced { files: u32, replacements: u32, changed: Vec<RelPath>, skipped: Vec<Skipped>, cancelled: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,9 +395,11 @@ impl Wire for Request {
                 e.u8(7);
                 e.path(path);
             }
-            Request::FindFiles { query, limit } => {
+            Request::FindFiles { query, include, exclude, limit } => {
                 e.u8(8);
                 e.str(query);
+                e.str(include);
+                e.str(exclude);
                 e.u32(*limit);
             }
             Request::Search { query } => {
@@ -367,6 +434,19 @@ impl Wire for Request {
                 opts.enc(e);
             }
             Request::Shutdown => e.u8(16),
+            Request::Paths { name, sink, limit } => {
+                e.u8(17);
+                e.str(name);
+                e.str(sink);
+                e.u32(*limit);
+            }
+            Request::Replace { query, replacement, only, skip } => {
+                e.u8(18);
+                query.enc(e);
+                e.str(replacement);
+                e.seq(only, |e, p| e.path(p));
+                e.seq(skip, |e, p| e.path(p));
+            }
         }
     }
 
@@ -384,7 +464,7 @@ impl Wire for Request {
             5 => Request::Rename { from: d.path()?, to: d.path()? },
             6 => Request::Delete { path: d.path()? },
             7 => Request::Stat { path: d.path()? },
-            8 => Request::FindFiles { query: text(d)?, limit: d.u32()? },
+            8 => Request::FindFiles { query: text(d)?, include: text(d)?, exclude: text(d)?, limit: d.u32()? },
             9 => Request::Search { query: SearchQuery::dec(d)? },
             10 => Request::Cancel { target: d.u64()? },
             11 => Request::Lens { fns: d.seq(MAX_ITEMS, 8, LensFn::dec)? },
@@ -393,6 +473,13 @@ impl Wire for Request {
             14 => Request::Reach { name: text(d)?, limit: d.u32()? },
             15 => Request::Reindex { opts: IndexOpts::dec(d)? },
             16 => Request::Shutdown,
+            17 => Request::Paths { name: text(d)?, sink: text(d)?, limit: d.u32()? },
+            18 => Request::Replace {
+                query: SearchQuery::dec(d)?,
+                replacement: text(d)?,
+                only: d.seq(MAX_ITEMS, 4, |d| d.path())?,
+                skip: d.seq(MAX_ITEMS, 4, |d| d.path())?,
+            },
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -508,6 +595,48 @@ impl Wire for Site {
     }
 }
 
+impl Wire for FlowArg {
+    fn enc(&self, e: &mut Enc) {
+        e.str(&self.text);
+        put_names(e, &self.from);
+    }
+    fn dec(d: &mut Dec<'_>) -> WireResult<Self> {
+        Ok(Self { text: d.string(MAX_ARG_TEXT)?, from: d.seq(MAX_ARGS, 4, |d| d.string(MAX_NAME))? })
+    }
+}
+
+impl Wire for Hop {
+    fn enc(&self, e: &mut Enc) {
+        self.site.enc(e);
+        e.seq(&self.args, |e, a| a.enc(e));
+    }
+    fn dec(d: &mut Dec<'_>) -> WireResult<Self> {
+        Ok(Self { site: Site::dec(d)?, args: d.seq(MAX_ARGS, 8, FlowArg::dec)? })
+    }
+}
+
+impl Wire for CallPath {
+    fn enc(&self, e: &mut Enc) {
+        e.str(&self.sink);
+        e.str(&self.kind);
+        e.seq(&self.hops, |e, h| h.enc(e));
+        e.bool(self.flows);
+    }
+    fn dec(d: &mut Dec<'_>) -> WireResult<Self> {
+        Ok(Self { sink: d.string(MAX_NAME)?, kind: d.string(MAX_NAME)?, hops: d.seq(MAX_HOPS, 32, Hop::dec)?, flows: d.bool()? })
+    }
+}
+
+impl Wire for Skipped {
+    fn enc(&self, e: &mut Enc) {
+        e.path(&self.path);
+        e.str(&self.why);
+    }
+    fn dec(d: &mut Dec<'_>) -> WireResult<Self> {
+        Ok(Self { path: d.path()?, why: d.string(MAX_SNIPPET)? })
+    }
+}
+
 impl Wire for SearchStats {
     fn enc(&self, e: &mut Enc) {
         e.u32(self.files_scanned);
@@ -580,6 +709,19 @@ impl Wire for Reply {
                 e.seq(sites, |e, x| x.enc(e));
                 e.bool(*truncated);
             }
+            Reply::Paths { paths, truncated } => {
+                e.u8(11);
+                e.seq(paths, |e, x| x.enc(e));
+                e.bool(*truncated);
+            }
+            Reply::Replaced { files, replacements, changed, skipped, cancelled } => {
+                e.u8(12);
+                e.u32(*files);
+                e.u32(*replacements);
+                e.seq(changed, |e, p| e.path(p));
+                e.seq(skipped, |e, x| x.enc(e));
+                e.bool(*cancelled);
+            }
         }
     }
 
@@ -595,6 +737,14 @@ impl Wire for Reply {
             8 => Reply::SearchDone(SearchStats::dec(d)?),
             9 => Reply::Lens { fns: d.seq(MAX_ITEMS, 17, LensInfo::dec)? },
             10 => Reply::Sites { sites: d.seq(MAX_ITEMS, 28, Site::dec)?, truncated: d.bool()? },
+            11 => Reply::Paths { paths: d.seq(MAX_ITEMS, 13, CallPath::dec)?, truncated: d.bool()? },
+            12 => Reply::Replaced {
+                files: d.u32()?,
+                replacements: d.u32()?,
+                changed: d.seq(MAX_ITEMS, 4, |d| d.path())?,
+                skipped: d.seq(MAX_ITEMS, 8, Skipped::dec)?,
+                cancelled: d.bool()?,
+            },
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -739,7 +889,7 @@ mod tests {
             Request::Rename { from: p("a"), to: p("b") },
             Request::Delete { path: p("a") },
             Request::Stat { path: p("a") },
-            Request::FindFiles { query: "mn".into(), limit: 50 },
+            Request::FindFiles { query: "mn".into(), include: "*.rs".into(), exclude: "target/**".into(), limit: 50 },
             Request::Search {
                 query: SearchQuery { pattern: "fo+".into(), regex: true, case_sensitive: true, whole_word: false, include: "*.rs".into(), exclude: String::new(), max_hits: 9 },
             },
@@ -748,6 +898,13 @@ mod tests {
             Request::Callers { name: "f".into(), limit: 1 },
             Request::Defs { name: "f".into(), limit: 2 },
             Request::Reach { name: "f".into(), limit: 3 },
+            Request::Paths { name: "f".into(), sink: "memcpy".into(), limit: 3 },
+            Request::Replace {
+                query: SearchQuery { pattern: "a(b)".into(), regex: true, ..Default::default() },
+                replacement: "$1".into(),
+                only: vec![p("a/b")],
+                skip: vec![p("c"), p("d")],
+            },
             Request::Reindex { opts: IndexOpts::default() },
             Request::Shutdown,
         ]
@@ -766,6 +923,19 @@ mod tests {
             Out::Reply(7, Reply::SearchDone(SearchStats { files_scanned: 1, files_matched: 1, hits: 2, truncated: true, elapsed_ms: 3 })),
             Out::Reply(8, Reply::Lens { fns: vec![LensInfo { callers: 1, defs: 2, callees: 3, reach: vec!["system".into()], reach_more: true }] }),
             Out::Reply(9, Reply::Sites { sites: vec![site()], truncated: true }),
+            Out::Reply(
+                10,
+                Reply::Paths {
+                    paths: vec![CallPath {
+                        sink: "memcpy".into(),
+                        kind: "memory".into(),
+                        hops: vec![Hop { site: site(), args: vec![FlowArg { text: "buf".into(), from: vec!["line".into()] }, FlowArg::default()] }, Hop::default()],
+                        flows: true,
+                    }],
+                    truncated: false,
+                },
+            ),
+            Out::Reply(11, Reply::Replaced { files: 2, replacements: 9, changed: vec![p("a"), p("b/c")], skipped: vec![Skipped { path: p("d"), why: "changed".into() }], cancelled: true }),
             Out::Event(Event::Hello { protocol: 1, root: "/r".into(), name: "r".into() }),
             Out::Event(Event::Index(IndexStatus { phase: IndexPhase::Ready, files_done: 1, files_total: 2, bytes: 3, symbols: 4, skipped: 5, from_cache: 6, elapsed_ms: 7 })),
             Out::Event(Event::Fatal { msg: "gone".into() }),

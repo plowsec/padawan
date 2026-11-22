@@ -222,6 +222,30 @@ pub struct EditorOptions {
     pub show_lenses: bool,
     /// Give the editor keyboard focus this frame (after opening a file, closing an overlay).
     pub request_focus: bool,
+    /// Enter keeps the indentation of the line, and adds a level after an opening bracket or a block opener
+    /// (`:` in Python, `then`/`do` in Lua/Ruby/Shell…); a closing bracket typed on a blank line dedents.
+    /// Markdown: Enter continues a list item or a quote.
+    pub auto_indent: bool,
+    /// Right-click menu (Cut, Copy, Paste, Select All, Go to Definition, Find Callers…).
+    pub context_menu: bool,
+}
+
+/// An edit command from outside the widget (menu bar, palette). Queue with `EditorState::run`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditAction {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    ToggleComment,
+    Indent,
+    Outdent,
+    DuplicateLine,
+    DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
 }
 
 impl Default for EditorOptions {
@@ -235,6 +259,8 @@ impl Default for EditorOptions {
             show_whitespace: false,
             show_lenses: true,
             request_focus: false,
+            auto_indent: true,
+            context_menu: true,
         }
     }
 }
@@ -244,9 +270,18 @@ impl Default for EditorOptions {
 pub struct EditorState {
     _private: (),
     v: view::View,
+    /// Actions queued by `run`, applied by the next `show`.
+    queued: Vec<EditAction>,
 }
 
 impl EditorState {
+    /// Queue an edit command; the next `show` applies it (and takes keyboard focus).
+    pub fn run(&mut self, a: EditAction) {
+        if self.queued.len() < 64 {
+            self.queued.push(a);
+        }
+    }
+
     /// Cursor position.
     pub fn cursor(&self) -> Pos {
         self.v.sel.head
@@ -373,6 +408,8 @@ pub struct EditorOutput {
     pub goto_definition: Option<(String, Pos)>,
     /// Identifier under the cursor (empty when none): the shell uses it for "find callers of…".
     pub word_at_cursor: String,
+    /// "Find Callers" chosen in the context menu: the identifier.
+    pub find_callers: Option<String>,
 }
 
 /// Draw the editor in all the space `ui` has left and handle its input.

@@ -217,7 +217,7 @@ impl Fake {
                     None => err(ErrCode::NotFound, "no such file"),
                 }
             }
-            Request::FindFiles { query, limit } => match &script.files_override {
+            Request::FindFiles { query, limit, .. } => match &script.files_override {
                 Some(v) => Reply::FileMatches { items: (**v).clone(), total_files: v.len() as u32 },
                 None => {
                     let fs = self.fs.lock().unwrap();
@@ -313,6 +313,8 @@ impl Fake {
                 out.event(Event::Index(self.status(IndexPhase::Ready)));
                 Reply::Done
             }
+            Request::Paths { .. } => Reply::Paths { paths: Vec::new(), truncated: false },
+            Request::Replace { .. } => Reply::Replaced { files: 0, replacements: 0, changed: Vec::new(), skipped: Vec::new(), cancelled: false },
             Request::Shutdown => return,
         };
         out.reply(id, reply);

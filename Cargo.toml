@@ -17,6 +17,7 @@ margin-code = { path = "crates/margin-code" }
 margin-engine = { path = "crates/margin-engine" }
 margin-editor = { path = "crates/margin-editor" }
 margin-gui = { path = "crates/margin-gui" }
+margin-md = { path = "crates/margin-md" }
 margin-shot = { path = "crates/margin-shot" }
 
 # Third-party. Adding one: docs/deps.md first (supply-chain checks, 7-day cooldown).

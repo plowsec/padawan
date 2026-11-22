@@ -448,6 +448,7 @@ impl App {
             show_whitespace: self.settings.show_whitespace,
             show_lenses: code_hints,
             request_focus: false,
+            ..Default::default()
         };
         let focus = std::mem::take(&mut self.focus_editor);
         let mut area = rect;
@@ -569,7 +570,7 @@ impl App {
                     if let Some(old) = p.req.take() {
                         ws.cancel(old);
                     }
-                    p.req = Some(ws.send(margin_proto::Request::FindFiles { query: q, limit: crate::palette::FILE_LIMIT }, crate::workspace::Pending::FindFiles));
+                    p.req = Some(ws.send(margin_proto::Request::FindFiles { query: q, include: String::new(), exclude: String::new(), limit: crate::palette::FILE_LIMIT }, crate::workspace::Pending::FindFiles));
                 }
             }
             if let Some(w) = p.wait_left(now) {

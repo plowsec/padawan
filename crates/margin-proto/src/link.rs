@@ -106,6 +106,8 @@ pub trait Opener: Send {
     /// Ask for the sub-directories of `path` (`None`: the home directory). The answer comes through `poll_browse`.
     fn browse(&mut self, path: Option<&Path>, waker: Waker);
     fn poll_browse(&mut self) -> Option<DirListing>;
+    /// Open another window, on `folder` if given. Fire and forget; the default does nothing.
+    fn new_window(&mut self, _folder: Option<&Path>) {}
 }
 
 /// Both ends in one process.
@@ -269,10 +271,10 @@ mod tests {
         let (s2c_r, s2c_w) = pipe();
         let client = client_over_io(s2c_r, c2s_w, noop());
         let (rx, out) = server_over_io(c2s_r, s2c_w);
-        let id = client.request(Request::FindFiles { query: "x".into(), limit: 3 });
+        let id = client.request(Request::FindFiles { query: "x".into(), include: String::new(), exclude: String::new(), limit: 3 });
         let (got, req) = rx.recv().unwrap();
         assert_eq!(got, id);
-        assert_eq!(req, Request::FindFiles { query: "x".into(), limit: 3 });
+        assert_eq!(req, Request::FindFiles { query: "x".into(), include: String::new(), exclude: String::new(), limit: 3 });
         out.reply(got, Reply::Done);
         out.event(Event::Fatal { msg: "x".into() });
         assert_eq!(wait(&client), Out::Reply(id, Reply::Done));

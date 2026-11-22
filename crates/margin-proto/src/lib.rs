@@ -23,4 +23,4 @@ pub use msg::*;
 pub use path::RelPath;
 
 /// Bumped on any wire change. Worker and GUI are the same binary; a mismatch means a stale process.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;

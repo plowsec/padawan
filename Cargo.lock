@@ -1276,9 +1276,20 @@ dependencies = [
  "margin-code",
  "margin-editor",
  "margin-engine",
+ "margin-md",
  "margin-proto",
  "margin-shot",
  "margin-testutil",
+ "margin-theme",
+]
+
+[[package]]
+name = "margin-md"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "margin-code",
+ "margin-shot",
  "margin-theme",
 ]
 

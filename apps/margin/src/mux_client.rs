@@ -146,6 +146,11 @@ impl Opener for MuxOpener {
     fn poll_browse(&mut self) -> Option<DirListing> {
         self.browse_rx.try_recv().ok()
     }
+
+    fn new_window(&mut self, folder: Option<&Path>) {
+        let folder = folder.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let _ = self.to_launcher.send(ToLauncher::NewWindow { folder });
+    }
 }
 
 impl Drop for MuxOpener {

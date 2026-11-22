@@ -16,3 +16,8 @@ pub const MAX_SNIPPET: usize = 512;
 pub const MAX_DIR_ENTRIES: usize = 50_000;
 /// Items in any list reply (hits, sites, matches, lens rows).
 pub const MAX_ITEMS: usize = 100_000;
+
+/// Call path: hops, arguments per call, bytes of one argument's text.
+pub const MAX_HOPS: usize = 16;
+pub const MAX_ARGS: usize = 16;
+pub const MAX_ARG_TEXT: usize = 96;

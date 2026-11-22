@@ -722,7 +722,7 @@ fn clamp_limit(limit: u32) -> usize {
 fn query_op(sh: &Shared, id: ReqId, req: Request, cancel: &AtomicBool) {
     let snap = sh.snap();
     match req {
-        Request::FindFiles { query, limit } => {
+        Request::FindFiles { query, limit, .. } => {
             let items = crate::fuzzy::find(&sh.query, &snap.files, &query, limit);
             sh.reply(id, Reply::FileMatches { items, total_files: u32::try_from(snap.files.len()).unwrap_or(u32::MAX) });
         }

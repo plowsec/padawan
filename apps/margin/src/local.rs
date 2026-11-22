@@ -56,4 +56,10 @@ impl Opener for LocalOpener {
     fn poll_browse(&mut self) -> Option<DirListing> {
         self.browse_rx.try_recv().ok()
     }
+
+    fn new_window(&mut self, folder: Option<&Path>) {
+        if let Err(e) = crate::window::spawn(folder, true) {
+            eprintln!("margin: {e}");
+        }
+    }
 }

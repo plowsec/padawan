@@ -20,6 +20,8 @@ pub enum ToLauncher {
     Quit,
     /// Folder picker: list the sub-directories of `path` (empty: the home directory).
     Browse { path: String },
+    /// Open another window (a new launcher process). `folder`: absolute path to open there; empty = none.
+    NewWindow { folder: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +54,10 @@ impl ToLauncher {
                 e.u8(4);
                 e.str(path);
             }
+            ToLauncher::NewWindow { folder } => {
+                e.u8(5);
+                e.str(folder);
+            }
         }
         e.finish()
     }
@@ -63,6 +69,7 @@ impl ToLauncher {
             2 => ToLauncher::Engine { gen: d.u32()?, payload: d.bytes(MAX_FRAME)?.to_vec() },
             3 => ToLauncher::Quit,
             4 => ToLauncher::Browse { path: d.string(MAX_PATH)? },
+            5 => ToLauncher::NewWindow { folder: d.string(MAX_PATH)? },
             t => return Err(WireError::BadTag(t)),
         };
         d.finish()?;
@@ -124,6 +131,8 @@ mod tests {
             ToLauncher::Engine { gen: 2, payload: vec![1, 2, 3] },
             ToLauncher::Quit,
             ToLauncher::Browse { path: "/tmp".into() },
+            ToLauncher::NewWindow { folder: String::new() },
+            ToLauncher::NewWindow { folder: "/tmp/x".into() },
         ] {
             assert_eq!(ToLauncher::decode(&m.encode()).unwrap(), m);
         }

@@ -21,6 +21,8 @@ use std::path::PathBuf;
 
 use margin_proto::Opener;
 
+use margin_md as _;
+
 mod app;
 pub mod commands;
 pub mod fuzzy;

@@ -169,7 +169,7 @@ fn flow(h: &mut H, t: &TempDir) {
 
     // New file, rename, delete: the finder follows.
     h.call(Request::WriteFile { path: p("zdir/fresh_needle.txt"), data: b"delta".to_vec(), expect_mtime_ns: None, create_new: true });
-    let Reply::FileMatches { items, total_files } = h.call(Request::FindFiles { query: "frneedle".into(), limit: 10 }) else { panic!() };
+    let Reply::FileMatches { items, total_files } = h.call(Request::FindFiles { query: "frneedle".into(), include: String::new(), exclude: String::new(), limit: 10 }) else { panic!() };
     assert_eq!(total_files, 5);
     assert_eq!(items[0].path.as_str(), "zdir/fresh_needle.txt");
     assert!(matches!(h.call(Request::Rename { from: p("zdir/fresh_needle.txt"), to: p("moved.txt") }), Reply::Done));
@@ -180,7 +180,7 @@ fn flow(h: &mut H, t: &TempDir) {
     assert!(matches!(h.call(Request::CreateDir { path: p("zdir/sub") }), Reply::Done));
     assert!(matches!(h.call(Request::Stat { path: p("zdir/sub") }), Reply::Meta(m) if m.kind == EntryKind::Dir));
 
-    let Reply::FileMatches { items, .. } = h.call(Request::FindFiles { query: "main".into(), limit: 10 }) else { panic!() };
+    let Reply::FileMatches { items, .. } = h.call(Request::FindFiles { query: "main".into(), include: String::new(), exclude: String::new(), limit: 10 }) else { panic!() };
     assert_eq!(items[0].path.as_str(), "src/main.rs");
     let Reply::Lens { fns } = h.call(Request::Lens { fns: vec![LensFn { name: "main".into(), callees: vec!["run_cmd".into()] }] }) else { panic!() };
     assert_eq!(fns.len(), 1);
@@ -363,7 +363,7 @@ fn spawn_local_serves() {
     let mut h = H::new(margin_engine::spawn_local(cfg(t.path(), None), Arc::new(|| {})));
     assert!(matches!(h.hello(), Event::Hello { .. }));
     h.ready(0);
-    let Reply::FileMatches { items, total_files } = h.call(Request::FindFiles { query: "notes".into(), limit: 5 }) else { panic!() };
+    let Reply::FileMatches { items, total_files } = h.call(Request::FindFiles { query: "notes".into(), include: String::new(), exclude: String::new(), limit: 5 }) else { panic!() };
     assert_eq!((items[0].path.as_str(), total_files), ("notes.md", 4));
     assert_eq!(h.search(q("alpha")).unwrap().0.len(), 1);
 }

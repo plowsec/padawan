@@ -11,6 +11,7 @@
 //! | `Spawn { gen, root }` | checks the folder (`sandbox::check_root`), stops the old worker, starts a new one |
 //! | `Engine { gen, payload }` | writes `payload` to the worker of `gen`; stale generations are dropped |
 //! | `Browse { path }` | lists sub-directory names (folder picker) |
+//! | `NewWindow { folder }` | starts another launcher (rate-limited) |
 //! | `Quit` / end of stream / bad frame | stops the worker, exits |
 
 use std::io::Write;
@@ -87,6 +88,12 @@ pub fn run(args: &Args) -> Result<(), String> {
                     let listing = crate::browse::list(Some(Path::new(&path)).filter(|p| !p.as_os_str().is_empty()));
                     send(&to_gui, &FromLauncher::Dirs(listing));
                 });
+            }
+            Ok(ToLauncher::NewWindow { folder }) => {
+                let folder = Some(Path::new(&folder)).filter(|p| !p.as_os_str().is_empty());
+                if let Err(e) = crate::window::spawn(folder, false) {
+                    eprintln!("margin: {e}");
+                }
             }
             Ok(ToLauncher::Quit) => break,
             Err(e) => {

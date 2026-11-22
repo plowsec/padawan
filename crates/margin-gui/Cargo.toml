@@ -16,6 +16,7 @@ margin-proto.workspace = true
 margin-code.workspace = true
 margin-theme.workspace = true
 margin-editor.workspace = true
+margin-md.workspace = true
 
 [dev-dependencies]
 margin-engine.workspace = true
