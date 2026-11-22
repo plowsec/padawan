@@ -1,0 +1,20 @@
+[package]
+name = "margin-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+margin-proto.workspace = true
+margin-code.workspace = true
+regex.workspace = true
+memchr.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+margin-testutil.workspace = true

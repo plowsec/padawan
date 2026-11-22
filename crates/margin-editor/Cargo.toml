@@ -1,0 +1,18 @@
+[package]
+name = "margin-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+egui.workspace = true
+margin-code.workspace = true
+margin-theme.workspace = true
+
+[dev-dependencies]
+margin-shot.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "margin-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+margin-proto.workspace = true
+margin-code.workspace = true
+margin-theme.workspace = true
+margin-editor.workspace = true
+
+[dev-dependencies]
+margin-engine.workspace = true
+margin-testutil.workspace = true
+margin-shot.workspace = true

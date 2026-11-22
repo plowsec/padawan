@@ -1,0 +1,4 @@
+# Recursive deletes of a computed path wiped a project once (an empty path is the cwd).
+disallowed-methods = [
+    { path = "std::fs::remove_dir_all", reason = "no recursive delete: unlink the files you created, then remove_dir; tests use margin_testutil::TempDir" },
+]

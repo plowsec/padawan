@@ -1,0 +1,22 @@
+[package]
+name = "margin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "margin"
+path = "src/main.rs"
+
+[dependencies]
+margin-proto.workspace = true
+margin-engine.workspace = true
+margin-gui.workspace = true
+
+[dev-dependencies]
+margin-testutil.workspace = true
