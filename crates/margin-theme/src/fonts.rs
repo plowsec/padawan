@@ -4,7 +4,7 @@
 //! |---|---|---|---|---|
 //! | ui (Proportional) | SF (`SFNS.ttf`) | Inter, Noto Sans, DejaVu Sans | Segoe UI | Ubuntu-Light |
 //! | code (Monospace) | SF Mono, Menlo | DejaVu Sans Mono, Noto Sans Mono | Cascadia Mono, Consolas | Hack |
-//! | symbols (both) | Menlo, Apple Symbols | DejaVu Sans, Noto Symbols | Segoe UI Symbol | egui-icons |
+//! | symbols + CJK (both) | Menlo, Apple Symbols, Hiragino Sans GB, Arial Unicode | DejaVu Sans, Noto Symbols | Segoe UI Symbol | egui-icons |
 //!
 //! Only fixed system paths are read. Never a font from the open folder.
 //! Files are read once per process, at start-up, before the first frame.
@@ -46,7 +46,13 @@ pub fn stack() -> &'static (FontDefinitions, FontReport) {
 mod paths {
     pub const UI: &[&str] = &["/System/Library/Fonts/SFNS.ttf"];
     pub const CODE: &[&str] = &["/System/Library/Fonts/SFNSMono.ttf", "/System/Library/Fonts/Menlo.ttc"];
-    pub const SYMBOLS: &[&str] = &["/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Apple Symbols.ttf"];
+    pub const SYMBOLS: &[&str] = &[
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        // CJK: notes and comments in Chinese / Japanese / Korean must not render as boxes.
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ];
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -161,6 +167,14 @@ mod tests {
         assert!(!defs.families[&FontFamily::Monospace].is_empty());
         if cfg!(target_os = "macos") {
             assert_eq!(report.ui.first().map(String::as_str), Some("SFNS"), "{report}");
+            let ctx = Context::default();
+            install(&ctx);
+            ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+            for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+                for ch in ['a', 'é', '→', '·', '…', '世', 'あ', '⌘', '⇧', '⌥', '⌃', '×', '▸', '▾', '●'] {
+                    assert!(ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::new(13.0, fam.clone()), ch)), "{fam:?} lacks {ch}");
+                }
+            }
         }
     }
 }

@@ -421,9 +421,9 @@ impl Theme {
         v.window_stroke = Stroke::new(1.0, ui.border);
         v.window_corner_radius = CornerRadius::same(6);
         v.menu_corner_radius = CornerRadius::same(5);
-        let shadow = if self.mode == Mode::Dark { 130 } else { 45 };
+        let shadow: u8 = if self.mode == Mode::Dark { 130 } else { 45 };
         v.window_shadow = Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(shadow) };
-        v.popup_shadow = Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(shadow * 3 / 4) };
+        v.popup_shadow = Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(shadow / 4 * 3) };
         v.window_highlight_topmost = false;
         v.faint_bg_color = ui.row_hover;
         v.extreme_bg_color = ui.input_bg;
@@ -525,6 +525,17 @@ mod tests {
                 let (r, g, b) = (i32::from(c.r()), i32::from(c.g()), i32::from(c.b()));
                 assert!(!(b > g + 25 && r > g + 25), "{} is purple", a.name());
             }
+        }
+    }
+
+    #[test]
+    fn apply_installs_the_style_in_both_modes() {
+        for mode in [Mode::Dark, Mode::Light] {
+            let ctx = egui::Context::default();
+            let t = Theme::new(mode, Look::default());
+            t.apply(&ctx);
+            t.apply(&ctx);
+            assert_eq!(ctx.global_style().visuals.panel_fill, t.ui.panel_bg);
         }
     }
 
