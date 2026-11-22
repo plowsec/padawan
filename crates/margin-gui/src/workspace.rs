@@ -16,8 +16,19 @@ pub enum Pending {
     Read { tab: u64, reload: bool },
     Write { tab: u64, rev: u64 },
     Stat { tab: u64 },
+    /// Palette files.
     FindFiles,
-    Search,
+    /// Sidebar names list.
+    Names,
+    /// Search tab `tab`.
+    Search(u64),
+    /// Replace from search tab `tab`.
+    Replace(u64),
+    /// Call paths from this function.
+    Paths(String),
+    /// Save As: create the missing parent directories in order, then the file.
+    SaveAsDir { tab: u64, path: RelPath, rest: Vec<RelPath> },
+    SaveAs { tab: u64, path: RelPath, rev: u64 },
     Lens { tab: u64, rev: u64 },
     Callers(String),
     Defs(String),

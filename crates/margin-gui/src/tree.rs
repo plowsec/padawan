@@ -9,7 +9,8 @@
 //! | Enter | open file / toggle folder |
 //! | F2 | rename |
 //!
-//! Context menu: New File…, New Folder…, Rename…, Delete…, Copy Path, Copy Relative Path.
+//! Right-click: `TreeAction::Menu` (the app draws the shared context menu: New File in Folder…, New Folder…,
+//! Rename…, Delete…, Copy Path, Copy Relative Path, Open in New Window for folders).
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +67,8 @@ pub enum TreeAction {
     /// Copy the absolute path (the app knows the root).
     CopyAbs(RelPath),
     Error(String),
+    /// Right-click on a row (`Some(path, is_dir)`) or on empty space (`None`), at the pointer.
+    Menu(Option<(RelPath, bool)>, egui::Pos2),
 }
 
 #[derive(Default)]
@@ -155,6 +158,11 @@ impl Tree {
             self.reveal = Some(p.clone());
         }
         load
+    }
+
+    /// Row index of `p` (tests, menus).
+    pub fn row_of(&self, p: &RelPath) -> Option<usize> {
+        self.index_of(p)
     }
 
     pub fn start_edit(&mut self, kind: EditKind) {
@@ -276,6 +284,7 @@ impl Tree {
         if focused {
             ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { vertical_arrows: true, horizontal_arrows: true, tab: false, escape: false }));
             self.keyboard(ui, &mut out);
+            widgets::hold_focus(ui);
         }
         if self.dirty {
             self.rebuild();
@@ -283,17 +292,7 @@ impl Tree {
         if bg.clicked() {
             ui.memory_mut(|m| m.request_focus(id));
         }
-        bg.context_menu(|ui| {
-            if ui.button("New File…").clicked() {
-                self.start_edit(EditKind::NewFile(RelPath::root()));
-            }
-            if ui.button("New Folder…").clicked() {
-                self.start_edit(EditKind::NewFolder(RelPath::root()));
-            }
-        });
-        if self.dirty {
-            self.rebuild();
-        }
+        let mut bg_menu = bg.secondary_clicked().then(|| bg.interact_pointer_pos().unwrap_or(rect.center()));
 
         let row_h = t.row_h();
         let reveal = self.reveal.take().and_then(|p| self.index_of(&p)).or_else(|| self.edit.as_ref().and_then(|_| self.rows.iter().position(|r| r.new_entry)));
@@ -309,7 +308,7 @@ impl Tree {
         }
         let n = self.rows.len();
         let mut clicked: Option<usize> = None;
-        let mut menu: Option<(usize, MenuPick)> = None;
+        let mut menu: Option<(usize, egui::Pos2)> = None;
         widgets::virtual_rows(&mut child, Id::unique("tree-scroll"), n, row_h, reveal, |ui, i, r| {
             let row = &self.rows[i];
             let indent = 8.0 + f32::from(row.depth) * 12.0;
@@ -358,29 +357,9 @@ impl Tree {
             if resp.clicked() {
                 clicked = Some(i);
             }
-            resp.context_menu(|ui| {
-                let mut pick = |p| menu = Some((i, p));
-                if ui.button("New File…").clicked() {
-                    pick(MenuPick::NewFile);
-                }
-                if ui.button("New Folder…").clicked() {
-                    pick(MenuPick::NewFolder);
-                }
-                ui.separator();
-                if ui.button("Rename…").clicked() {
-                    pick(MenuPick::Rename);
-                }
-                if ui.button("Delete…").clicked() {
-                    pick(MenuPick::Delete);
-                }
-                ui.separator();
-                if ui.button("Copy Path").clicked() {
-                    pick(MenuPick::CopyAbs);
-                }
-                if ui.button("Copy Relative Path").clicked() {
-                    pick(MenuPick::CopyRel);
-                }
-            });
+            if resp.secondary_clicked() {
+                menu = Some((i, resp.interact_pointer_pos().unwrap_or(r.center())));
+            }
         });
         if let Some(i) = clicked {
             ui.memory_mut(|m| m.request_focus(id));
@@ -392,33 +371,20 @@ impl Tree {
                 EntryKind::Other => {}
             }
         }
-        if let Some((i, pick)) = menu {
+        if let Some((i, pos)) = menu {
             let row = self.rows[i].clone();
-            let dir = if row.kind == EntryKind::Dir { row.path.clone() } else { row.path.parent().unwrap_or_default() };
-            match pick {
-                MenuPick::NewFile => self.start_edit(EditKind::NewFile(dir)),
-                MenuPick::NewFolder => self.start_edit(EditKind::NewFolder(dir)),
-                MenuPick::Rename => self.start_edit(EditKind::Rename(row.path)),
-                MenuPick::Delete => out.push(TreeAction::AskDelete(row.path, row.kind == EntryKind::Dir)),
-                MenuPick::CopyAbs => out.push(TreeAction::CopyAbs(row.path)),
-                MenuPick::CopyRel => out.push(TreeAction::Copy(row.path.as_str().to_owned())),
-            }
+            self.selected = Some(row.path.clone());
+            bg_menu = None;
+            out.push(TreeAction::Menu(Some((row.path, row.kind == EntryKind::Dir)), pos));
+        }
+        if let Some(pos) = bg_menu {
+            out.push(TreeAction::Menu(None, pos));
         }
         if self.dirty {
             ui.ctx().request_repaint();
         }
         out
     }
-}
-
-#[derive(Clone, Copy)]
-enum MenuPick {
-    NewFile,
-    NewFolder,
-    Rename,
-    Delete,
-    CopyAbs,
-    CopyRel,
 }
 
 fn commit_edit(e: Edit) -> Option<TreeAction> {

@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use margin_proto::link::local_pair;
@@ -66,6 +66,38 @@ pub struct Script {
     pub index_phase: Option<IndexStatus>,
     /// Send `Fatal { msg }` after answering this many requests.
     pub fatal_after: Option<(usize, String)>,
+    /// `Paths` reply (default: none).
+    pub paths_override: Option<Arc<Vec<CallPath>>>,
+    pub paths_truncated: bool,
+    /// `FindFiles` total to report (default: files in the fake folder).
+    pub total_files: Option<u32>,
+}
+
+/// `*` (not `/`), `**` (anything), `?`. A pattern without `/` matches the file name.
+pub fn glob(pat: &str, path: &str) -> bool {
+    fn go(p: &[char], s: &[char]) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some('*') if p.get(1) == Some(&'*') => {
+                let rest = if p.get(2) == Some(&'/') { &p[3..] } else { &p[2..] };
+                (0..=s.len()).any(|i| go(rest, &s[i..]))
+            }
+            Some('*') => (0..=s.len()).take_while(|&i| i == 0 || s[i - 1] != '/').any(|i| go(&p[1..], &s[i..])),
+            Some('?') => !s.is_empty() && s[0] != '/' && go(&p[1..], &s[1..]),
+            Some(c) => s.first() == Some(c) && go(&p[1..], &s[1..]),
+        }
+    }
+    let pat = pat.trim();
+    let target = if pat.contains('/') { path } else { path.rsplit('/').next().unwrap_or(path) };
+    go(&pat.chars().collect::<Vec<_>>(), &target.chars().collect::<Vec<_>>())
+}
+
+/// Comma-separated globs: include (empty = all) and exclude (empty = none).
+pub fn filtered(path: &str, include: &str, exclude: &str) -> bool {
+    let list = |s: &str| s.split(',').map(str::trim).filter(|g| !g.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+    let inc = list(include);
+    let exc = list(exclude);
+    (inc.is_empty() || inc.iter().any(|g| glob(g, path))) && !exc.iter().any(|g| glob(g, path))
 }
 
 #[derive(Clone)]
@@ -74,6 +106,8 @@ pub struct Fake {
     pub log: Arc<Mutex<Vec<(ReqId, Request)>>>,
     pub script: Arc<Mutex<Script>>,
     pub opened: Arc<Mutex<Vec<String>>>,
+    /// `Opener::new_window` calls.
+    pub windows: Arc<Mutex<Vec<Option<PathBuf>>>>,
 }
 
 impl Fake {
@@ -82,7 +116,7 @@ impl Fake {
         for (p, d) in files {
             fs.add(p, d.as_bytes().to_vec());
         }
-        Fake { fs: Arc::new(Mutex::new(fs)), log: Default::default(), script: Default::default(), opened: Default::default() }
+        Fake { fs: Arc::new(Mutex::new(fs)), log: Default::default(), script: Default::default(), opened: Default::default(), windows: Default::default() }
     }
 
     pub fn requests(&self) -> Vec<Request> {
@@ -186,8 +220,14 @@ impl Fake {
                 }
             }
             Request::CreateDir { path } => {
-                self.fs.lock().unwrap().dirs.insert(path.to_string());
-                Reply::Done
+                let mut fs = self.fs.lock().unwrap();
+                if fs.files.contains_key(path.as_str()) {
+                    err(ErrCode::Exists, "a file with that name exists")
+                } else if fs.dirs.insert(path.to_string()) {
+                    Reply::Done
+                } else {
+                    err(ErrCode::Exists, "already exists")
+                }
             }
             Request::Rename { from, to } => {
                 let mut fs = self.fs.lock().unwrap();
@@ -217,13 +257,23 @@ impl Fake {
                     None => err(ErrCode::NotFound, "no such file"),
                 }
             }
-            Request::FindFiles { query, limit, .. } => match &script.files_override {
-                Some(v) => Reply::FileMatches { items: (**v).clone(), total_files: v.len() as u32 },
+            Request::FindFiles { query, limit, include, exclude } => match &script.files_override {
+                Some(v) => Reply::FileMatches { items: (**v).clone(), total_files: script.total_files.unwrap_or(v.len() as u32) },
                 None => {
                     let fs = self.fs.lock().unwrap();
                     let q: Vec<char> = query.to_lowercase().chars().collect();
+                    let is_glob = query.contains(['*', '?']);
                     let mut items = Vec::new();
                     for p in fs.files.keys() {
+                        if !filtered(p, &include, &exclude) {
+                            continue;
+                        }
+                        if is_glob {
+                            if glob(&query, p) {
+                                items.push(FileMatch { path: RelPath::new(p).unwrap(), score: -(p.len() as i32), positions: Vec::new() });
+                            }
+                            continue;
+                        }
                         let mut pos = Vec::new();
                         let mut qi = 0;
                         for (i, c) in p.char_indices() {
@@ -238,7 +288,7 @@ impl Fake {
                     }
                     items.sort_by_key(|m| -m.score);
                     items.truncate(limit as usize);
-                    Reply::FileMatches { items, total_files: fs.files.len() as u32 }
+                    Reply::FileMatches { items, total_files: script.total_files.unwrap_or(fs.files.len() as u32) }
                 }
             },
             Request::Search { query } => {
@@ -253,6 +303,9 @@ impl Fake {
                         let mut v = Vec::new();
                         for (p, f) in &fs.files {
                             let Ok(text) = std::str::from_utf8(&f.data) else { continue };
+                            if !filtered(p, &query.include, &query.exclude) {
+                                continue;
+                            }
                             for (ln, line) in text.lines().enumerate() {
                                 let hay = if query.case_sensitive { line.to_owned() } else { line.to_lowercase() };
                                 let needle = if query.case_sensitive { query.pattern.clone() } else { query.pattern.to_lowercase() };
@@ -313,8 +366,43 @@ impl Fake {
                 out.event(Event::Index(self.status(IndexPhase::Ready)));
                 Reply::Done
             }
-            Request::Paths { .. } => Reply::Paths { paths: Vec::new(), truncated: false },
-            Request::Replace { .. } => Reply::Replaced { files: 0, replacements: 0, changed: Vec::new(), skipped: Vec::new(), cancelled: false },
+            Request::Paths { .. } => Reply::Paths { paths: script.paths_override.as_ref().map(|v| (**v).clone()).unwrap_or_default(), truncated: script.paths_truncated },
+            Request::Replace { query, replacement, only, skip } => {
+                // Literal, line by line (like the fake search).
+                let mut fs = self.fs.lock().unwrap();
+                let (mut files, mut n, mut changed, mut skipped) = (0u32, 0u32, Vec::new(), Vec::new());
+                let paths: Vec<String> = fs.files.keys().cloned().collect();
+                for p in paths {
+                    let rp = RelPath::new(&p).unwrap();
+                    if (!only.is_empty() && !only.contains(&rp)) || !filtered(&p, &query.include, &query.exclude) {
+                        continue;
+                    }
+                    let Ok(text) = String::from_utf8(fs.files[&p].data.clone()) else { continue };
+                    let needle = if query.case_sensitive { query.pattern.clone() } else { query.pattern.to_lowercase() };
+                    let hay = if query.case_sensitive { text.clone() } else { text.to_lowercase() };
+                    let count = hay.matches(&needle).count() as u32;
+                    if count == 0 || needle.is_empty() {
+                        continue;
+                    }
+                    if skip.contains(&rp) {
+                        skipped.push(Skipped { path: rp, why: "open with unsaved edits".into() });
+                        continue;
+                    }
+                    let mut out_s = String::new();
+                    let mut last = 0;
+                    for (i, _) in hay.match_indices(&needle) {
+                        out_s.push_str(&text[last..i]);
+                        out_s.push_str(&replacement);
+                        last = i + needle.len();
+                    }
+                    out_s.push_str(&text[last..]);
+                    fs.add(&p, out_s.into_bytes());
+                    files += 1;
+                    n += count;
+                    changed.push(rp);
+                }
+                Reply::Replaced { files, replacements: n, changed, skipped, cancelled: false }
+            }
             Request::Shutdown => return,
         };
         out.reply(id, reply);
@@ -356,5 +444,9 @@ impl Opener for FakeOpener {
 
     fn poll_browse(&mut self) -> Option<DirListing> {
         self.queue.pop_front()
+    }
+
+    fn new_window(&mut self, folder: Option<&Path>) {
+        self.fake.windows.lock().unwrap().push(folder.map(Path::to_path_buf));
     }
 }

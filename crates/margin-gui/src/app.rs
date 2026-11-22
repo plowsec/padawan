@@ -4,27 +4,32 @@
 //! 1. theme, zoom; drain engine / picker / background channels
 //! 2. window focus, dropped files, close requests
 //! 3. shortcuts (consumed before anything else sees them)
-//! 4. overlays (modal > picker > palette); if one is open, remaining keyboard input is dropped
-//! 5. layout: status bar, sidebar, tab strip, editor, results panel; toasts
-//! 6. timers: search / palette debounce, hints, settings + state saves (`request_repaint_after`)
+//! 4. overlays (modal > picker > palette > context menu > menu bar menu); if one is open, remaining keyboard input is dropped
+//! 5. layout: menu bar, status bar, sidebar, tab strip, tab body (editor | preview, search, settings), bottom panel; toasts
+//! 6. timers: names / search / palette debounce, hints, Markdown parse, hot exit, settings + state saves (`request_repaint_after`)
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use egui::{pos2, vec2, CursorIcon, Id, Key, Rect, Sense, Ui};
-use margin_editor::{Document, EditorOptions};
+use margin_editor::{Document, EditAction, EditorOptions};
+use margin_md::PreviewOutput;
 use margin_proto::{Meta, Opener, RelPath, Waker};
 use margin_theme::Theme;
 
 use crate::commands::{self, Cmd};
+use crate::features::CtxMenu;
 use crate::hints::OutlineDone;
+use crate::md_preview::{self, MdDone};
+use crate::menubar::{self, MenuBar};
 use crate::palette::Palette;
+use crate::paths_view::{PathsAction, PathsPanel};
 use crate::picker::Picker;
 use crate::results_panel::{ResultsAction, ResultsPanel};
 use crate::sanitize::{clean, sanitize};
-use crate::search_panel::SearchPanel;
 use crate::settings::Settings;
+use crate::side::{SideOut, SideSearch};
 use crate::state::{Persist, SavedState, SIDEBAR_W};
 use crate::status::{self, StatusInfo};
 use crate::tabs::{Banner, StripAction, TabKind, Tabs, View};
@@ -37,25 +42,39 @@ use crate::{widgets, RunOpts};
 pub const BIG_DOC: usize = 256 << 10;
 pub const SETTINGS_DELAY: f64 = 0.5;
 pub const REINDEX_EVERY: f64 = 2.0;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SideTab {
-    Files,
-    Search,
-}
+/// Hot-exit write this long after the last edit of an untitled buffer.
+pub const HOT_DELAY: f64 = 1.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Then {
     CloseTab(u64),
+    CloseTabs(Vec<u64>),
     CloseFolder,
     Quit,
     Open(PathBuf),
+}
+
+/// Save As dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaveAs {
+    pub tab: u64,
+    pub text: String,
+    pub error: Option<String>,
+    /// Requests out.
+    pub busy: bool,
+    /// After a successful save.
+    pub then: Option<Then>,
+    pub focus: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Modal {
     Unsaved { tabs: Vec<u64>, then: Then },
     Delete { path: RelPath, dir: bool },
+    /// Confirm a replace in search tab `tab`; `only`: one file.
+    Replace { tab: u64, only: Option<RelPath>, hits: usize, files: usize, with: String },
+    SaveAs(SaveAs),
+    About,
 }
 
 pub struct AfterSave {
@@ -99,17 +118,19 @@ pub struct App {
     pub(crate) ws: Option<Workspace>,
     pub(crate) tabs: Tabs,
     pub(crate) tree: Tree,
-    pub(crate) search: SearchPanel,
+    pub(crate) side: SideSearch,
     pub(crate) results: Option<ResultsPanel>,
+    pub(crate) paths: Option<PathsPanel>,
     pub(crate) results_h: f32,
     pub(crate) palette: Option<Palette>,
     pub(crate) picker: Option<Picker>,
     pub(crate) modal: Option<Modal>,
+    pub(crate) menubar: MenuBar,
+    pub(crate) ctx_menu: Option<CtxMenu>,
     pub(crate) after_save: Option<AfterSave>,
     pub(crate) toasts: Toasts,
     pub(crate) back: Vec<Loc>,
     pub(crate) forward: Vec<Loc>,
-    pub(crate) side: SideTab,
     pub(crate) mru: Vec<Cmd>,
     pub(crate) settings_at: Option<f64>,
     pub(crate) state_at: Option<f64>,
@@ -119,6 +140,10 @@ pub struct App {
     pub(crate) doc_rx: Receiver<DocDone>,
     pub(crate) outline_tx: Sender<OutlineDone>,
     pub(crate) outline_rx: Receiver<OutlineDone>,
+    pub(crate) md_tx: Sender<MdDone>,
+    pub(crate) md_rx: Receiver<MdDone>,
+    /// Editor share of a split Markdown tab (this run only).
+    pub(crate) md_ratio: f32,
     /// Why the last open failed (welcome screen / picker).
     pub(crate) open_error: Option<String>,
     /// File to open once the folder says hello.
@@ -135,6 +160,15 @@ pub struct App {
     pub(crate) focus_editor: bool,
     /// Id the editor widget used last frame (tests locate hint segments with it).
     pub(crate) editor_id: Option<Id>,
+    /// Secondary window: no hot-exit restore, no last session.
+    pub(crate) fresh: bool,
+    pub(crate) untitled_next: u32,
+    /// Edit actions sent to the editor (tests; last 64).
+    pub(crate) edit_log: Vec<EditAction>,
+    /// Preview outputs handled as if the preview returned them (tests).
+    pub(crate) inject_md: Vec<PreviewOutput>,
+    /// Open modal's title and buttons last frame (tests).
+    pub(crate) modal_seen: (String, Vec<(String, Rect)>),
 }
 
 pub(crate) fn waker(ctx: &egui::Context) -> Waker {
@@ -143,7 +177,7 @@ pub(crate) fn waker(ctx: &egui::Context) -> Waker {
 }
 
 impl App {
-    /// Reads `settings.conf` / `state.conf` (start-up, before the first frame) and opens `opts.folder`.
+    /// Reads `settings.conf` / `state.conf` and the hot-exit buffers (start-up, before the first frame) and opens `opts.folder`.
     pub fn new(ctx: &egui::Context, opts: RunOpts) -> App {
         let persist = Persist::new(opts.config_dir.as_deref());
         let settings = Settings::parse(&persist.load("settings.conf"));
@@ -152,6 +186,7 @@ impl App {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let (doc_tx, doc_rx) = channel();
         let (outline_tx, outline_rx) = channel();
+        let (md_tx, md_rx) = channel();
         let mut app = App {
             opener: opts.opener,
             gui_sandbox: opts.gui_sandbox,
@@ -164,17 +199,19 @@ impl App {
             ws: None,
             tabs: Tabs::default(),
             tree: Tree::default(),
-            search: SearchPanel::default(),
+            side: SideSearch::default(),
             results: None,
+            paths: None,
             results_h: 220.0,
             palette: None,
             picker: None,
             modal: None,
+            menubar: MenuBar::default(),
+            ctx_menu: None,
             after_save: None,
             toasts: Toasts::default(),
             back: Vec::new(),
             forward: Vec::new(),
-            side: SideTab::Files,
             mru: Vec::new(),
             settings_at: None,
             state_at: None,
@@ -184,6 +221,9 @@ impl App {
             doc_rx,
             outline_tx,
             outline_rx,
+            md_tx,
+            md_rx,
+            md_ratio: 0.5,
             open_error: None,
             start_file: opts.file,
             restored: false,
@@ -196,7 +236,13 @@ impl App {
             smoke: None,
             focus_editor: false,
             editor_id: None,
+            fresh: opts.fresh,
+            untitled_next: 1,
+            edit_log: Vec::new(),
+            inject_md: Vec::new(),
+            modal_seen: Default::default(),
         };
+        app.restore_untitled();
         if let Some(f) = opts.folder {
             app.open_folder_now(f);
         }
@@ -207,9 +253,10 @@ impl App {
         &self.theme
     }
 
-    /// Quit: remember tabs, write settings and state now (bounded wait).
+    /// Quit: remember tabs and untitled buffers, write settings and state now (bounded wait).
     pub fn on_exit(&mut self) {
         self.snapshot_tabs();
+        self.hot_exit(true);
         self.persist.save_settings(self.settings.write());
         self.persist.save_state(self.state.write());
         self.persist.flush(std::time::Duration::from_secs(1));
@@ -224,8 +271,15 @@ impl App {
         self.persist.flush(std::time::Duration::from_secs(5));
     }
 
+    /// Handle `out` as if the active tab's Markdown preview returned it next frame (tests; the preview itself
+    /// may draw nothing headless).
+    #[doc(hidden)]
+    pub fn inject_preview_output(&mut self, out: PreviewOutput) {
+        self.inject_md.push(out);
+    }
+
     pub(crate) fn any_overlay(&self) -> bool {
-        self.modal.is_some() || self.picker.is_some() || self.palette.is_some()
+        self.modal.is_some() || self.picker.is_some() || self.palette.is_some() || self.ctx_menu.is_some() || self.menubar.is_open()
     }
 
     /// One frame.
@@ -271,7 +325,14 @@ impl App {
     }
 
     fn layout(&mut self, ui: &mut Ui, t: &Theme) {
-        let full = ui.max_rect();
+        let mut full = ui.max_rect();
+        if self.settings.menu_bar {
+            let mr = Rect::from_min_size(full.min, vec2(full.width(), menubar::height(t)));
+            self.menubar.bar(ui, mr, t, self.frame);
+            full.min.y = mr.bottom();
+        } else if self.menubar.is_open() {
+            self.menubar.close();
+        }
         let sb_h = status::height(t);
         let status_r = Rect::from_min_max(pos2(full.left(), full.bottom() - sb_h), full.max);
         let body = Rect::from_min_max(full.min, pos2(full.right(), status_r.top()));
@@ -300,45 +361,33 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut Ui, rect: Rect, t: &Theme) {
-        let head_h = (t.row_h() + 12.0).round();
-        let head = Rect::from_min_size(rect.min, vec2(rect.width(), head_h));
+        let rect = rect.with_max_x(rect.right() - 1.0);
         let name = self.ws.as_ref().map(Workspace::display_name).unwrap_or_default();
-        let seg_w = 112.0;
-        let seg = Rect::from_min_size(pos2(head.right() - 12.0 - seg_w, head.center().y - (t.row_h() - 2.0) / 2.0), vec2(seg_w, t.row_h() - 2.0));
-        widgets::text_at(ui, head.with_max_x(seg.left() - 8.0), head.left() + 16.0, &name, t.font_ui(), t.ui.text_strong);
-        let cur = usize::from(self.side == SideTab::Search);
-        if let Some(i) = widgets::segmented(ui, seg, &["Files", "Search"], cur, t, Id::unique("side-switch")) {
-            self.side = if i == 1 { SideTab::Search } else { SideTab::Files };
-            if self.side == SideTab::Search {
-                self.search.focus_query = true;
+        let mut outs = Vec::new();
+        let rest = self.side.head(ui, rect, t, self.now, &name, &mut outs);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rest));
+        child.set_clip_rect(rest);
+        if self.side.list_active() {
+            self.side.list(&mut child, rest, t, &mut outs);
+        } else {
+            let active = self.tabs.active_file().filter(|f| !f.is_untitled()).map(|f| f.path.clone());
+            let acts = self.tree.show(&mut child, rest, t, active.as_ref());
+            for a in acts {
+                self.tree_action(a);
             }
         }
-        let content = Rect::from_min_max(pos2(rect.left(), head.bottom()), pos2(rect.right() - 1.0, rect.bottom()));
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content));
-        child.set_clip_rect(content);
-        match self.side {
-            SideTab::Files => {
-                let active = self.tabs.active_file().map(|f| f.path.clone());
-                let acts = self.tree.show(&mut child, content, t, active.as_ref());
-                for a in acts {
-                    self.tree_action(a);
-                }
-            }
-            SideTab::Search => {
-                let (send, open) = self.search.show(&mut child, content, t, self.now);
-                if let Some(q) = send {
-                    self.start_search(q);
-                }
-                if let Some(h) = open {
-                    self.open_file(h.path, Some((h.line, h.col, h.len)), true);
-                    self.focus_editor = false;
-                }
+        for o in outs {
+            match o {
+                SideOut::Open(p) => self.open_file(p, None, true),
+                SideOut::Search(q) => self.open_search_tab(Some(q), false),
+                SideOut::Leave => self.focus_editor = true,
+                SideOut::Menu(p, pos) => self.open_path_menu(p, pos),
             }
         }
     }
 
     fn main_area(&mut self, ui: &mut Ui, rect: Rect, t: &Theme) {
-        if self.ws.is_none() {
+        if self.ws.is_none() && self.tabs.list.is_empty() {
             let recent = self.state.recent.clone();
             match welcome::show(ui, rect, t, self.mac, &recent, self.open_error.as_deref()) {
                 Some(WelcomeOut::OpenFolder) => self.run_cmd(Cmd::OpenFolder),
@@ -351,7 +400,22 @@ impl App {
         let mut y = rect.top();
         if !self.tabs.list.is_empty() {
             let sr = Rect::from_min_size(rect.min, vec2(rect.width(), strip_h));
-            match self.tabs.strip(ui, sr, t) {
+            let md = self.tabs.active_file().is_some_and(|f| f.doc().is_some() && f.markdown());
+            let tog_w = if md { 84.0 } else { 0.0 };
+            let strip_r = sr.with_max_x(sr.right() - tog_w);
+            let act = self.tabs.strip(ui, strip_r, t);
+            if md {
+                let tr = Rect::from_min_max(pos2(strip_r.right(), sr.top()), sr.max);
+                ui.painter().rect_filled(tr, 0.0, t.ui.panel_bg);
+                ui.painter().hline(tr.x_range(), tr.bottom() - 0.5, t.border());
+                ui.painter().vline(tr.left() + 0.5, tr.y_range(), t.border());
+                let mut on = self.tabs.active_file().and_then(|f| f.preview.as_ref()).is_some_and(|p| p.on);
+                let br = Rect::from_center_size(tr.center(), vec2(64.0, (t.row_h() - 2.0).round()));
+                if widgets::text_toggle(ui, br, "Preview", &mut on, "Markdown preview", t, preview_toggle_id()) {
+                    self.run_cmd(Cmd::MdPreview);
+                }
+            }
+            match act {
                 Some(StripAction::Activate(i)) => {
                     self.tabs.activate(i);
                     self.focus_editor = true;
@@ -360,6 +424,11 @@ impl App {
                 Some(StripAction::Close(i)) => {
                     if let Some(id) = self.tabs.list.get(i).map(|x| x.id) {
                         self.close_tab(id);
+                    }
+                }
+                Some(StripAction::Menu(i, pos)) => {
+                    if let Some(id) = self.tabs.list.get(i).map(|x| x.id) {
+                        self.open_tab_menu(id, pos);
                     }
                 }
                 None => {}
@@ -378,26 +447,42 @@ impl App {
             }
             area.min.y = br.bottom();
         }
-        // Results panel.
+        // Bottom panel: results or paths.
         let mut editor_r = area;
-        if self.results.is_some() {
+        if self.results.is_some() || self.paths.is_some() {
             let h = self.results_h.clamp(80.0, (area.height() - 120.0).max(80.0));
             let rr = Rect::from_min_max(pos2(area.left(), area.bottom() - h), area.max);
             editor_r.max.y = rr.top();
-            let act = self.results.as_mut().and_then(|r| r.show(ui, rr, t));
-            if let Some(r) = &self.results {
-                self.results_h = r.height;
-            }
-            match act {
-                Some(ResultsAction::Jump(s)) => {
-                    self.open_file(s.path, Some((s.line, s.col, s.len)), true);
-                    self.focus_editor = false;
+            if let Some(p) = self.paths.as_mut() {
+                let act = p.show(ui, rr, t);
+                self.results_h = p.height;
+                match act {
+                    Some(PathsAction::Jump(s)) => {
+                        self.open_file(s.path, Some((s.line, s.col, s.len)), true);
+                        self.focus_editor = false;
+                    }
+                    Some(PathsAction::Close) => {
+                        self.paths = None;
+                        self.focus_editor = true;
+                    }
+                    None => {}
                 }
-                Some(ResultsAction::Close) => {
-                    self.results = None;
-                    self.focus_editor = true;
+            } else {
+                let act = self.results.as_mut().and_then(|r| r.show(ui, rr, t));
+                if let Some(r) = &self.results {
+                    self.results_h = r.height;
                 }
-                None => {}
+                match act {
+                    Some(ResultsAction::Jump(s)) => {
+                        self.open_file(s.path, Some((s.line, s.col, s.len)), true);
+                        self.focus_editor = false;
+                    }
+                    Some(ResultsAction::Close) => {
+                        self.results = None;
+                        self.focus_editor = true;
+                    }
+                    None => {}
+                }
             }
         }
         self.editor_area(ui, editor_r, t);
@@ -429,13 +514,24 @@ impl App {
             welcome::empty_hints(ui, rect, t, mac);
             return;
         };
-        if matches!(self.tabs.list[ai].kind, TabKind::Settings) {
-            let before = self.settings.clone();
-            let out = crate::settings_pane::show(ui, rect, &mut self.settings, t, mac);
-            if out.changed && self.settings != before {
-                self.settings_changed(out.reindex);
+        match &mut self.tabs.list[ai].kind {
+            TabKind::Settings => {
+                let before = self.settings.clone();
+                let out = crate::settings_pane::show(ui, rect, &mut self.settings, t, mac);
+                if out.changed && self.settings != before {
+                    self.settings_changed(out.reindex);
+                }
+                return;
             }
-            return;
+            TabKind::Search(s) => {
+                let tab = s.tab;
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("search-tab", tab)));
+                child.set_clip_rect(rect);
+                let out = s.show(&mut child, rect, t, self.now);
+                self.search_out(tab, out);
+                return;
+            }
+            TabKind::File(_) => {}
         }
         let tab_id = self.tabs.list[ai].id;
         let code_hints = self.settings.code_hints;
@@ -448,7 +544,8 @@ impl App {
             show_whitespace: self.settings.show_whitespace,
             show_lenses: code_hints,
             request_focus: false,
-            ..Default::default()
+            auto_indent: self.settings.auto_indent,
+            context_menu: true,
         };
         let focus = std::mem::take(&mut self.focus_editor);
         let mut area = rect;
@@ -487,6 +584,9 @@ impl App {
             widgets::text_at(ui, br, br.left() + 16.0, "Not valid UTF-8 — read-only", t.font_small(), t.ui.text_muted);
             area.min.y = br.bottom();
         }
+        let pointer = ui.ctx().pointer_hover_pos();
+        let mut ratio = self.md_ratio;
+        let mut injected = std::mem::take(&mut self.inject_md);
         let Some(f) = self.tabs.list[ai].file_mut() else { return };
         if matches!(f.view, View::Text(_)) {
             opts.request_focus = focus || std::mem::take(&mut f.focus_editor);
@@ -494,28 +594,81 @@ impl App {
             // Keep the request until the text arrives.
             f.focus_editor |= focus;
         }
-        let mut result = None;
-        match &mut f.view {
-            View::Loading => {
-                ui.painter().rect_filled(area, 0.0, t.code.bg);
-            }
-            View::Binary(size) => {
-                ui.painter().rect_filled(area, 0.0, t.code.bg);
-                let s = format!("Binary file · {}", human_size(*size));
-                ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, s, t.font_ui(), t.ui.text_muted);
-            }
-            View::Message(m) => {
-                ui.painter().rect_filled(area, 0.0, t.code.bg);
-                ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, m.as_str(), t.font_ui(), t.ui.text_muted);
-            }
-            View::Text(doc) => {
-                let lenses: &[margin_editor::Lens] = if code_hints { &f.hints.lenses } else { &[] };
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).id_salt(("editor", tab_id)));
-                child.set_clip_rect(area);
-                self.editor_id = Some(child.make_persistent_id("margin-editor"));
-                result = Some(margin_editor::show(&mut child, doc, &mut f.st, &opts, t, lenses));
+        // Markdown preview split.
+        let pv_on = matches!(f.view, View::Text(_)) && f.preview.as_ref().is_some_and(|p| p.on);
+        let (mut ed_r, mut pv_r) = (Some(area), None);
+        if pv_on {
+            let show_editor = f.preview.as_ref().is_some_and(|p| p.show_editor);
+            if area.width() < md_preview::SPLIT_MIN_W {
+                if show_editor {
+                    ed_r = Some(area);
+                } else {
+                    ed_r = None;
+                    pv_r = Some(area);
+                }
+            } else {
+                let min = md_preview::SIDE_MIN_W;
+                let x = (area.left() + area.width() * ratio).clamp(area.left() + min, area.right() - min).round();
+                ed_r = Some(Rect::from_min_max(area.min, pos2(x, area.bottom())));
+                pv_r = Some(Rect::from_min_max(pos2(x + 1.0, area.top()), area.max));
+                ui.painter().vline(x + 0.5, area.y_range(), t.border());
+                let hr = Rect::from_min_max(pos2(x - 3.0, area.top()), pos2(x + 4.0, area.bottom()));
+                let h = ui.interact(hr, preview_divider_id(), Sense::drag()).on_hover_cursor(CursorIcon::ResizeHorizontal);
+                if h.dragged() {
+                    ratio = ((x + h.drag_delta().x - area.left()) / area.width()).clamp(0.05, 0.95);
+                }
             }
         }
+        let mut result = None;
+        let mut md_out: Option<PreviewOutput> = None;
+        let crate::tabs::FileTab { view, st, hints, preview, .. } = f;
+        if let Some(area) = ed_r {
+            match view {
+                View::Loading => {
+                    ui.painter().rect_filled(area, 0.0, t.code.bg);
+                }
+                View::Binary(size) => {
+                    ui.painter().rect_filled(area, 0.0, t.code.bg);
+                    let s = format!("Binary file · {}", human_size(*size));
+                    ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, s, t.font_ui(), t.ui.text_muted);
+                }
+                View::Message(m) => {
+                    ui.painter().rect_filled(area, 0.0, t.code.bg);
+                    ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, m.as_str(), t.font_ui(), t.ui.text_muted);
+                }
+                View::Text(doc) => {
+                    let lenses: &[margin_editor::Lens] = if code_hints { &hints.lenses } else { &[] };
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).id_salt(("editor", tab_id)));
+                    child.set_clip_rect(area);
+                    self.editor_id = Some(child.make_persistent_id("margin-editor"));
+                    result = Some(margin_editor::show(&mut child, doc, st, &opts, t, lenses));
+                }
+            }
+        }
+        if let (Some(pr), Some(pv)) = (pv_r, preview.as_mut()) {
+            ui.painter().rect_filled(pr, 0.0, t.code.bg);
+            // Editor → preview scroll sync, unless the pointer is on the preview (the user scrolls it).
+            let top = st.top_line();
+            if pv.editor_top != Some(top) {
+                if pv.editor_top.is_some() && ed_r.is_some() && !pointer.is_some_and(|p| pr.contains(p)) {
+                    pv.state.scroll_to_line(top);
+                }
+                pv.editor_top = Some(top);
+            }
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(pr.shrink2(vec2(0.0, 0.0))).id_salt(("preview", tab_id)));
+            child.set_clip_rect(pr);
+            match pv.doc.clone() {
+                Some(d) => md_out = Some(margin_md::show(&mut child, &d, &mut pv.state, t)),
+                None => {
+                    child.painter().text(pr.center(), egui::Align2::CENTER_CENTER, "Rendering…", t.font_small(), t.ui.text_faint);
+                }
+            }
+        }
+        if !injected.is_empty() {
+            md_out = Some(injected.remove(0));
+            self.inject_md = injected;
+        }
+        self.md_ratio = ratio;
         if let Some(out) = result {
             self.word_at_cursor = out.word_at_cursor;
             if let Some((word, _)) = out.goto_definition {
@@ -524,9 +677,22 @@ impl App {
             if let Some((line, seg)) = out.lens_clicked {
                 self.lens_clicked(tab_id, line, seg);
             }
+            if let Some(w) = out.find_callers {
+                self.find_callers(w);
+            }
         }
-        if self.results.is_some() && ui.input(|i| i.key_pressed(Key::Escape)) && !self.tabs.active_file().is_some_and(|f| f.st.find_open()) {
+        if let Some(o) = md_out {
+            if let Some(dest) = o.link_clicked {
+                self.md_link(tab_id, &dest);
+            }
+            if let Some(line) = o.task_toggled {
+                self.md_task(tab_id, line);
+            }
+        }
+        let panel = self.results.is_some() || self.paths.is_some();
+        if panel && ui.input(|i| i.key_pressed(Key::Escape)) && !self.tabs.active_file().is_some_and(|f| f.st.find_open()) {
             self.results = None;
+            self.paths = None;
         }
     }
 
@@ -534,7 +700,7 @@ impl App {
         let mut info = StatusInfo { gui_sandbox: self.gui_sandbox.clone(), engine_sandbox: self.opener.sandbox().to_owned(), ..Default::default() };
         info.index = self.ws.as_ref().and_then(|w| w.index);
         if let Some(f) = self.tabs.active_file() {
-            info.path = clean(f.path.as_str());
+            info.path = if f.is_untitled() { f.title() } else { clean(f.path.as_str()) };
             if let Some(doc) = f.doc() {
                 let (l, c) = f.st.cursor();
                 let line = doc.line(l);
@@ -547,6 +713,9 @@ impl App {
                 if doc.read_only() {
                     info.notes.push("read-only");
                 }
+                if f.is_untitled() {
+                    info.notes.push("not saved");
+                }
             }
         }
         info
@@ -556,12 +725,34 @@ impl App {
         let now = self.now;
         let mut wait: Option<f64> = None;
         let mut want = |w: f64| wait = Some(wait.map_or(w, |x: f64| x.min(w)));
-        // Search.
-        if let Some(q) = self.search.due(now) {
-            self.start_search(q);
+        // Sidebar names list.
+        if !self.side.list_active() && (self.side.sent.is_some() || self.side.req.is_some()) {
+            if let (Some(r), Some(ws)) = (self.side.reset_list(), self.ws.as_mut()) {
+                ws.cancel(r);
+            }
         }
-        if let Some(w) = self.search.wait_left(now) {
-            want(w);
+        if self.ws.is_some() {
+            if let Some((query, include, exclude)) = self.side.due(now) {
+                if let Some(ws) = self.ws.as_mut() {
+                    if let Some(old) = self.side.req.take() {
+                        ws.cancel(old);
+                    }
+                    self.side.req = Some(ws.send(margin_proto::Request::FindFiles { query, include, exclude, limit: crate::side::NAMES_LIMIT }, crate::workspace::Pending::Names));
+                }
+            }
+            if let Some(w) = self.side.wait_left(now) {
+                want(w);
+            }
+        }
+        // Search tabs.
+        let due: Vec<(u64, margin_proto::SearchQuery)> = self.tabs.list.iter_mut().filter_map(|t| t.search_mut()).filter_map(|s| s.due(now).map(|q| (s.tab, q))).collect();
+        for (tab, q) in due {
+            self.start_search(tab, q);
+        }
+        for s in self.tabs.list.iter().filter_map(|t| t.search()) {
+            if let Some(w) = s.wait_left(now) {
+                want(w);
+            }
         }
         // Palette files.
         if let Some(p) = self.palette.as_mut() {
@@ -581,6 +772,14 @@ impl App {
         if let Some(w) = self.update_hints() {
             want(w);
         }
+        // Markdown preview.
+        if let Some(w) = self.update_preview() {
+            want(w);
+        }
+        // Untitled buffers → config dir.
+        if let Some(w) = self.hot_exit(false) {
+            want(w);
+        }
         // Tabs list → state.
         if std::mem::take(&mut self.tabs_changed) {
             self.snapshot_tabs();
@@ -588,7 +787,7 @@ impl App {
         let active = self.tabs.active_tab().map(|x| x.id);
         if active != self.last_active {
             self.last_active = active;
-            if let Some(p) = self.tabs.active_file().map(|f| f.path.clone()) {
+            if let Some(p) = self.tabs.active_file().filter(|f| !f.is_untitled()).map(|f| f.path.clone()) {
                 for d in self.tree.reveal(&p) {
                     self.list_dir(d);
                 }
@@ -650,6 +849,14 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+}
+
+pub fn preview_toggle_id() -> Id {
+    Id::unique("md-preview-toggle")
+}
+
+pub fn preview_divider_id() -> Id {
+    Id::unique("md-preview-divider")
 }
 
 pub fn human_size(n: u64) -> String {

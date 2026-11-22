@@ -12,6 +12,8 @@
 //! | `primary_button`, `quiet_button` | buttons |
 //! | `key_hint` | shortcut text, small mono muted |
 //! | `virtual_rows` | fixed-height virtualised list in a scroll area |
+//! | `menu_popup`, `menu_step`, `menu_keys` | popup menu: menu bar dropdowns and every context menu |
+//! | `text_toggle_off` | a disabled toggle |
 
 use std::sync::Arc;
 
@@ -215,6 +217,11 @@ pub fn text_toggle(ui: &mut Ui, rect: Rect, label: &str, on: &mut bool, tip: &st
     false
 }
 
+/// `text_toggle` drawn disabled (no interaction).
+pub fn text_toggle_off(ui: &Ui, rect: Rect, label: &str, t: &Theme) {
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, t.font_mono_ui(), t.ui.text_faint);
+}
+
 fn button(ui: &mut Ui, label: &str, t: &Theme, primary: bool) -> Response {
     let font = t.font_ui();
     let g = ui.painter().layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER);
@@ -286,6 +293,155 @@ pub fn virtual_rows(ui: &mut Ui, id: Id, n: usize, row_h: f32, reveal: Option<us
             row(ui, i, r);
         }
     });
+}
+
+// ---- menus (menu bar dropdowns and every context menu) ----
+
+/// One row of a popup menu.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuEntry {
+    pub label: String,
+    /// Right-aligned, muted mono.
+    pub shortcut: String,
+    pub enabled: bool,
+    /// Separator line (other fields ignored).
+    pub sep: bool,
+    /// Opens a submenu (`▸`).
+    pub submenu: bool,
+}
+
+impl MenuEntry {
+    pub fn item(label: impl Into<String>, shortcut: impl Into<String>, enabled: bool) -> MenuEntry {
+        MenuEntry { label: label.into(), shortcut: shortcut.into(), enabled, sep: false, submenu: false }
+    }
+
+    pub fn sep() -> MenuEntry {
+        MenuEntry { sep: true, ..Default::default() }
+    }
+
+    fn pickable(&self) -> bool {
+        !self.sep && self.enabled
+    }
+}
+
+pub struct MenuResp {
+    pub rect: Rect,
+    pub clicked: Option<usize>,
+    pub hovered: Option<usize>,
+    /// Rect of each entry (submenu placement).
+    pub rows: Vec<Rect>,
+}
+
+const MENU_SEP_H: f32 = 9.0;
+const MENU_PAD: f32 = 4.0;
+
+/// Size of a popup for `entries`.
+pub fn menu_size(ctx: &egui::Context, entries: &[MenuEntry], t: &Theme) -> egui::Vec2 {
+    let mut w: f32 = 180.0;
+    let mut h = 2.0 * MENU_PAD;
+    for e in entries {
+        if e.sep {
+            h += MENU_SEP_H;
+            continue;
+        }
+        h += t.row_h();
+        let lw = ctx.fonts_mut(|f| f.layout_no_wrap(e.label.clone(), t.font_ui(), Color32::PLACEHOLDER).size().x).min(360.0);
+        let sw = if e.shortcut.is_empty() { 0.0 } else { ctx.fonts_mut(|f| f.layout_no_wrap(e.shortcut.clone(), key_font(t), Color32::PLACEHOLDER).size().x) + 32.0 };
+        w = w.max(lw + sw + 24.0 + if e.submenu { 20.0 } else { 0.0 } + 2.0 * MENU_PAD);
+    }
+    vec2(w.round(), h.round())
+}
+
+fn key_font(t: &Theme) -> FontId {
+    FontId::monospace((t.look.ui_size - 2.0).max(9.0))
+}
+
+/// Next pickable entry from `from` in direction `d` (wraps). `None` when nothing is pickable.
+pub fn menu_step(entries: &[MenuEntry], from: Option<usize>, d: isize) -> Option<usize> {
+    let n = entries.len() as isize;
+    if n == 0 {
+        return None;
+    }
+    let mut i = from.map_or(if d > 0 { -1 } else { n }, |x| x as isize);
+    for _ in 0..n {
+        i = (i + d).rem_euclid(n);
+        if entries[i as usize].pickable() {
+            return Some(i as usize);
+        }
+    }
+    None
+}
+
+/// Draw a popup menu with its top-left at `pos` (kept on screen). Entry `i` has widget id `id.with(i)`.
+pub fn menu_popup(ctx: &egui::Context, id: Id, pos: Pos2, entries: &[MenuEntry], sel: Option<usize>, t: &Theme) -> MenuResp {
+    let size = menu_size(ctx, entries, t);
+    let screen = ctx.content_rect();
+    let x = pos.x.min(screen.right() - size.x - 4.0).max(screen.left() + 4.0);
+    let y = if pos.y + size.y > screen.bottom() - 4.0 { (screen.bottom() - 4.0 - size.y).max(screen.top() + 4.0) } else { pos.y };
+    let rect = Rect::from_min_size(pos2(x, y).round(), size);
+    let mut out = MenuResp { rect, clicked: None, hovered: None, rows: Vec::with_capacity(entries.len()) };
+    egui::Area::new(id).order(egui::Order::Foreground).fade_in(false).fixed_pos(rect.min).show(ctx, |ui| {
+        let p = ui.painter().clone();
+        p.add(ctx.global_style().visuals.popup_shadow.as_shape(rect, 6));
+        p.rect_filled(rect, 6.0, t.ui.overlay_bg);
+        p.rect_stroke(rect, 6.0, t.border(), egui::StrokeKind::Inside);
+        // Swallow clicks between rows.
+        ui.interact(rect, id.with("body"), Sense::click());
+        let mut y = rect.top() + MENU_PAD;
+        for (i, e) in entries.iter().enumerate() {
+            if e.sep {
+                let r = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), MENU_SEP_H));
+                p.hline(r.left() + 8.0..=r.right() - 8.0, (r.center().y).round() + 0.5, t.border());
+                out.rows.push(r);
+                y += MENU_SEP_H;
+                continue;
+            }
+            let r = Rect::from_min_size(pos2(rect.left() + MENU_PAD, y), vec2(rect.width() - 2.0 * MENU_PAD, t.row_h()));
+            out.rows.push(r);
+            y += t.row_h();
+            let resp = ui.interact(r, id.with(i), Sense::click());
+            let resp = if e.enabled { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp };
+            if resp.hovered() {
+                out.hovered = Some(i);
+            }
+            if e.enabled && (sel == Some(i) || resp.hovered()) {
+                p.rect_filled(r, 4.0, t.ui.row_selected);
+            }
+            let color = if e.enabled { t.ui.text_strong } else { t.ui.text_faint };
+            let mut right = r.right() - 10.0;
+            if e.submenu {
+                chevron(&p, pos2(right - 3.0, r.center().y), false, if e.enabled { t.ui.text_muted } else { t.ui.text_faint });
+                right -= 16.0;
+            }
+            let sw = if e.shortcut.is_empty() { 0.0 } else { text_right(ui, r, right, &e.shortcut, key_font(t), if e.enabled { t.ui.text_muted } else { t.ui.text_faint }) + 24.0 };
+            text_at(ui, r.with_max_x(right - sw), r.left() + 10.0, &e.label, t.font_ui(), color);
+            if resp.clicked() && e.enabled && !e.sep {
+                out.clicked = Some(i);
+            }
+        }
+    });
+    out
+}
+
+/// The focused list used the arrow keys this frame: stop egui moving focus with them (its lock filter only
+/// applies from the second focused frame).
+pub fn hold_focus(ui: &Ui) {
+    ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+}
+
+/// Keys a menu uses this frame (consumed): up, down, left, right, enter, esc.
+pub fn menu_keys(ctx: &egui::Context) -> [bool; 6] {
+    ctx.input_mut(|i| {
+        let m = egui::Modifiers::NONE;
+        [
+            i.consume_key(m, egui::Key::ArrowUp),
+            i.consume_key(m, egui::Key::ArrowDown),
+            i.consume_key(m, egui::Key::ArrowLeft),
+            i.consume_key(m, egui::Key::ArrowRight),
+            i.consume_key(m, egui::Key::Enter) || i.consume_key(m, egui::Key::Space),
+            i.consume_key(m, egui::Key::Escape),
+        ]
+    })
 }
 
 /// 1 px hairline, pixel-aligned.

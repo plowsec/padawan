@@ -1,8 +1,9 @@
 //! Results panel (bottom of the editor area): callers, definitions, callees, sinks, reach chains.
 //! Rows: `path:line` (muted mono) + snippet with the name highlighted + context (muted, right).
 //! Click / Enter jumps; Up / Down move; Esc or × closes; the top hairline drags to resize.
+//! `chrome` (frame, header, resize, close) is shared with the paths view.
 
-use egui::{pos2, vec2, CursorIcon, Id, Key, Rect, Sense, Ui};
+use egui::{pos2, vec2, Color32, CursorIcon, FontId, Id, Key, Rect, Sense, Ui};
 use margin_proto::limits::MAX_ITEMS;
 use margin_proto::Site;
 use margin_theme::Theme;
@@ -28,6 +29,57 @@ pub enum ResultsAction {
 
 pub fn panel_id() -> Id {
     Id::unique("results-panel")
+}
+
+/// Keys of a focused list panel: up, down, enter, esc.
+pub struct PanelKeys {
+    pub up: bool,
+    pub down: bool,
+    pub enter: bool,
+    pub esc: bool,
+}
+
+pub struct Chrome {
+    /// Below the header.
+    pub list: Rect,
+    /// Keys, when the panel has focus.
+    pub keys: Option<PanelKeys>,
+    pub close: bool,
+}
+
+/// Frame of a bottom panel in `rect`: background, top hairline (drag to resize `height`), header runs, ×.
+pub fn chrome(ui: &mut Ui, rect: Rect, t: &Theme, id: Id, height: &mut f32, focus: &mut bool, header: &[(&str, FontId, Color32)]) -> Chrome {
+    let row_h = t.row_h();
+    let p = ui.painter().clone();
+    p.rect_filled(rect, 0.0, t.ui.panel_bg);
+    p.hline(rect.x_range(), rect.top() + 0.5, t.border());
+    let bg = ui.interact(rect, id, Sense::click());
+    if bg.clicked() || std::mem::take(focus) {
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    let mut keys = None;
+    if ui.memory(|m| m.has_focus(id)) {
+        ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { vertical_arrows: true, horizontal_arrows: false, tab: false, escape: true }));
+        keys = Some(ui.input_mut(|i| {
+            let m = egui::Modifiers::NONE;
+            PanelKeys { up: i.consume_key(m, Key::ArrowUp), down: i.consume_key(m, Key::ArrowDown), enter: i.consume_key(m, Key::Enter), esc: i.consume_key(m, Key::Escape) }
+        }));
+        widgets::hold_focus(ui);
+    }
+    let hr = Rect::from_min_max(pos2(rect.left(), rect.top() - 3.0), pos2(rect.right(), rect.top() + 3.0));
+    let h = ui.interact(hr, id.with("resize"), Sense::drag()).on_hover_cursor(CursorIcon::ResizeVertical);
+    if h.dragged() {
+        *height = (*height - h.drag_delta().y).clamp(80.0, 900.0);
+    }
+    let head = Rect::from_min_size(rect.min, vec2(rect.width(), row_h + 2.0));
+    widgets::paint_job(ui, head.with_max_x(head.right() - 36.0), head.left() + 12.0, header);
+    let cr = Rect::from_center_size(pos2(head.right() - 18.0, head.center().y), vec2(20.0, 20.0));
+    let close = ui.interact(cr, id.with("close"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Close (Esc)");
+    if close.hovered() {
+        ui.painter().rect_filled(cr, 3.0, t.ui.row_selected);
+    }
+    widgets::close_x(ui.painter(), cr.center(), 3.5, if close.hovered() { t.ui.text_strong } else { t.ui.text_muted });
+    Chrome { list: Rect::from_min_max(pos2(rect.left(), head.bottom()), rect.max), keys, close: close.clicked() }
 }
 
 impl ResultsPanel {
@@ -60,64 +112,34 @@ impl ResultsPanel {
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, t: &Theme) -> Option<ResultsAction> {
         let mut act = None;
         let row_h = t.row_h();
-        let p = ui.painter().clone();
-        p.rect_filled(rect, 0.0, t.ui.panel_bg);
-        p.hline(rect.x_range(), rect.top() + 0.5, t.border());
         let id = panel_id();
-        let bg = ui.interact(rect, id, Sense::click());
-        if bg.clicked() || std::mem::take(&mut self.focus) {
-            ui.memory_mut(|m| m.request_focus(id));
-        }
-        let focused = ui.memory(|m| m.has_focus(id));
-        if focused {
-            ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { vertical_arrows: true, horizontal_arrows: false, tab: false, escape: true }));
-            let (up, down, enter, esc) = ui.input_mut(|i| {
-                (
-                    i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
-                    i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
-                    i.consume_key(egui::Modifiers::NONE, Key::Enter),
-                    i.consume_key(egui::Modifiers::NONE, Key::Escape),
-                )
-            });
+        let header = self.header();
+        let c = chrome(ui, rect, t, id, &mut self.height, &mut self.focus, &[(&header, t.font_small(), t.ui.text_muted)]);
+        if let Some(k) = c.keys {
             let n = self.sites.len();
             if n > 0 {
-                if down {
+                if k.down {
                     self.selected = Some(self.selected.map_or(0, |s| (s + 1).min(n - 1)));
                     self.reveal = self.selected;
                 }
-                if up {
+                if k.up {
                     self.selected = Some(self.selected.map_or(0, |s| s.saturating_sub(1)));
                     self.reveal = self.selected;
                 }
-                if enter {
+                if k.enter {
                     if let Some(s) = self.selected.and_then(|i| self.sites.get(i)) {
                         act = Some(ResultsAction::Jump(s.clone()));
                     }
                 }
             }
-            if esc {
+            if k.esc {
                 act = Some(ResultsAction::Close);
             }
         }
-        // Resize handle on the top hairline.
-        let hr = Rect::from_min_max(pos2(rect.left(), rect.top() - 3.0), pos2(rect.right(), rect.top() + 3.0));
-        let h = ui.interact(hr, id.with("resize"), Sense::drag()).on_hover_cursor(CursorIcon::ResizeVertical);
-        if h.dragged() {
-            self.height = (self.height - h.drag_delta().y).clamp(80.0, 900.0);
-        }
-        // Header.
-        let head = Rect::from_min_size(rect.min, vec2(rect.width(), row_h + 2.0));
-        widgets::text_at(ui, head.with_max_x(head.right() - 36.0), head.left() + 12.0, &self.header(), t.font_small(), t.ui.text_muted);
-        let cr = Rect::from_center_size(pos2(head.right() - 18.0, head.center().y), vec2(20.0, 20.0));
-        let close = ui.interact(cr, id.with("close"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Close (Esc)");
-        if close.hovered() {
-            ui.painter().rect_filled(cr, 3.0, t.ui.row_selected);
-        }
-        widgets::close_x(ui.painter(), cr.center(), 3.5, if close.hovered() { t.ui.text_strong } else { t.ui.text_muted });
-        if close.clicked() {
+        if c.close {
             act = Some(ResultsAction::Close);
         }
-        let list = Rect::from_min_max(pos2(rect.left(), head.bottom()), rect.max);
+        let list = c.list;
         if self.sites.is_empty() && !self.loading {
             let r = Rect::from_min_size(list.min, vec2(list.width(), row_h));
             widgets::text_at(ui, r, r.left() + 12.0, "Nothing found", t.font_small(), t.ui.text_faint);

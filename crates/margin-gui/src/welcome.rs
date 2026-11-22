@@ -14,6 +14,7 @@ pub enum WelcomeOut {
 
 const SHORTCUTS: &[(Cmd, &str)] = &[
     (Cmd::Palette, "Command palette"),
+    (Cmd::NewFile, "New file"),
     (Cmd::GoToFile, "Go to file"),
     (Cmd::SearchFolder, "Search in folder"),
     (Cmd::ToggleSidebar, "Toggle sidebar"),
@@ -82,7 +83,7 @@ pub fn show(ui: &mut Ui, rect: Rect, t: &Theme, mac: bool, recent: &[String], er
 /// Folder open, no tab.
 pub fn empty_hints(ui: &mut Ui, rect: Rect, t: &Theme, mac: bool) {
     ui.painter().rect_filled(rect, 0.0, t.code.bg);
-    let rows = [(Cmd::GoToFile, "Go to file"), (Cmd::Palette, "Command palette"), (Cmd::SearchFolder, "Search in folder"), (Cmd::NewFile, "New file")];
+    let rows = [(Cmd::GoToFile, "Go to file"), (Cmd::Palette, "Command palette"), (Cmd::SearchFolder, "Search in folder"), (Cmd::ShowFiles, "Find file by name"), (Cmd::NewFile, "New file")];
     let w = 300.0f32.min(rect.width() - 32.0);
     let row_h = t.row_h();
     let mut y = (rect.center().y - rows.len() as f32 * row_h / 2.0).round();

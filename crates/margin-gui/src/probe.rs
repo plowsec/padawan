@@ -2,7 +2,10 @@
 
 use margin_theme::Look;
 
-use crate::app::{App, Modal, SideTab};
+use margin_editor::EditAction;
+
+use crate::app::{App, Modal};
+use crate::side::SideMode;
 use crate::tabs::{Banner, View};
 
 #[derive(Clone, Debug, Default)]
@@ -31,10 +34,39 @@ pub struct Probe {
     pub modal: Option<String>,
     pub results_title: Option<String>,
     pub results: usize,
+    /// Active search tab (else the last one).
     pub search_hits: usize,
     pub search_files: usize,
     pub search_error: Option<String>,
-    pub side_search: bool,
+    pub search_summary: String,
+    pub search_note: Option<String>,
+    pub search_tabs: usize,
+    /// Tab id of that search tab (widget ids).
+    pub search_tab: Option<u64>,
+    pub search_query: String,
+    pub search_replace_shown: bool,
+    /// Sidebar: `"names"` / `"content"`, query, list rows (paths), count line.
+    pub side_mode: &'static str,
+    pub side_query: String,
+    pub side_list: Vec<String>,
+    pub side_count: String,
+    pub side_list_active: bool,
+    pub menu_open: Option<usize>,
+    pub menu_sel: Option<usize>,
+    pub ctx_menu: Vec<String>,
+    pub save_as_error: Option<String>,
+    pub save_as_text: Option<String>,
+    pub paths_title: Option<String>,
+    pub paths: usize,
+    pub paths_selected: Option<String>,
+    pub preview_on: bool,
+    pub preview_parsed: bool,
+    pub edit_log: Vec<EditAction>,
+    pub active_untitled: Option<u32>,
+    pub menu_bar: bool,
+    /// Open modal: title, buttons (label, rect).
+    pub modal_title: Option<String>,
+    pub modal_buttons: Vec<(String, egui::Rect)>,
     pub sidebar_visible: bool,
     pub toasts: Vec<String>,
     pub look: Look,
@@ -49,6 +81,7 @@ impl App {
     pub fn probe(&self) -> Probe {
         let f = self.tabs.active_file();
         let doc = f.and_then(|f| f.doc());
+        let search = self.tabs.active_tab().and_then(|t| t.search()).or_else(|| self.tabs.list.iter().rev().find_map(|t| t.search()));
         Probe {
             folder: self.ws.as_ref().map(|w| w.display_name()),
             fatal: self.ws.as_ref().and_then(|w| w.fatal.clone()),
@@ -82,13 +115,50 @@ impl App {
             modal: self.modal.as_ref().map(|m| match m {
                 Modal::Unsaved { .. } => "unsaved".to_owned(),
                 Modal::Delete { path, .. } => format!("delete {path}"),
+                Modal::Replace { hits, files, with, only, .. } => format!("replace {hits} in {files} with {with}{}", only.as_ref().map(|p| format!(" only {p}")).unwrap_or_default()),
+                Modal::SaveAs(_) => "save-as".to_owned(),
+                Modal::About => "about".to_owned(),
             }),
             results_title: self.results.as_ref().map(|r| r.header()),
             results: self.results.as_ref().map_or(0, |r| r.sites.len()),
-            search_hits: self.search.hits.len(),
-            search_files: self.search.files(),
-            search_error: self.search.error.clone(),
-            side_search: self.side == SideTab::Search,
+            search_hits: search.map_or(0, |s| s.hits.len()),
+            search_files: search.map_or(0, |s| s.files()),
+            search_error: search.and_then(|s| s.error.clone()),
+            search_summary: search.map(|s| s.summary()).unwrap_or_default(),
+            search_note: search.and_then(|s| s.note.clone()),
+            search_tab: search.map(|s| s.tab),
+            search_query: search.map(|s| s.query.clone()).unwrap_or_default(),
+            search_replace_shown: search.is_some_and(|s| s.show_replace),
+            search_tabs: self.tabs.list.iter().filter(|t| t.search().is_some()).count(),
+            side_mode: match self.side.mode {
+                SideMode::Names => "names",
+                SideMode::Content => "content",
+            },
+            side_query: self.side.query.clone(),
+            side_list: self.side.items.iter().map(|m| m.path.to_string()).collect(),
+            side_count: self.side.count_line(),
+            side_list_active: self.side.list_active(),
+            menu_open: self.menubar.open,
+            menu_sel: self.menubar.sel,
+            ctx_menu: self.ctx_menu.as_ref().map(|m| m.items.iter().filter(|(e, _)| !e.sep).map(|(e, _)| if e.enabled { e.label.clone() } else { format!("({})", e.label) }).collect()).unwrap_or_default(),
+            save_as_error: match &self.modal {
+                Some(Modal::SaveAs(s)) => s.error.clone(),
+                _ => None,
+            },
+            save_as_text: match &self.modal {
+                Some(Modal::SaveAs(s)) => Some(s.text.clone()),
+                _ => None,
+            },
+            paths_title: self.paths.as_ref().map(|p| p.header()),
+            paths: self.paths.as_ref().map_or(0, |p| p.paths.len()),
+            paths_selected: self.paths.as_ref().and_then(|p| p.selected_loc()),
+            preview_on: f.and_then(|f| f.preview.as_ref()).is_some_and(|p| p.on),
+            preview_parsed: f.and_then(|f| f.preview.as_ref()).is_some_and(|p| p.doc.is_some()),
+            edit_log: self.edit_log.clone(),
+            active_untitled: f.and_then(|f| f.untitled),
+            menu_bar: self.settings.menu_bar,
+            modal_title: self.modal.as_ref().map(|_| self.modal_seen.0.clone()),
+            modal_buttons: if self.modal.is_some() { self.modal_seen.1.clone() } else { Vec::new() },
             sidebar_visible: self.state.sidebar_visible,
             toasts: self.toasts.list.iter().map(|t| t.text.clone()).collect(),
             look: self.theme.look,

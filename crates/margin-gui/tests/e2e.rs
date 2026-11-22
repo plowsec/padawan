@@ -51,6 +51,14 @@ impl E {
         self.shot.key(k, m);
         self.frames(1);
     }
+    fn click(&mut self, pos: egui::Pos2) {
+        self.shot.move_to([pos.x, pos.y]);
+        self.frames(1);
+        self.shot.button(true, Modifiers::NONE);
+        self.frames(1);
+        self.shot.release();
+        self.frames(1);
+    }
     fn text(&mut self, s: &str) {
         self.shot.text(s);
         self.frames(1);
@@ -95,7 +103,26 @@ fn real_engine_open_edit_save_search() {
     // Search finds the saved text.
     e.key(Key::F, Modifiers::COMMAND | Modifiers::SHIFT);
     e.text("gamma_marker");
+    e.key(Key::Enter, Modifiers::NONE);
     let p = e.until("search hit", |p| p.search_hits == 1);
     assert_eq!(p.search_files, 1);
+    let tab = p.search_tab.unwrap();
+
+    // Replace All through the confirm modal; the clean open tab reloads.
+    e.frames(1);
+    let r = e.shot.ctx().read_response(margin_gui::search_panel::replace_toggle_id(tab)).unwrap().rect;
+    e.click(r.center());
+    e.text("delta_marker");
+    e.frames(1);
+    let r = e.shot.ctx().read_response(margin_gui::search_panel::replace_all_id(tab)).unwrap().rect;
+    e.click(r.center());
+    let p = e.until("confirm", |p| p.modal.is_some() && !p.modal_buttons.is_empty());
+    assert_eq!(p.modal_title.as_deref(), Some("Replace 1 match in 1 file with “delta_marker”?"));
+    let b = p.modal_buttons.iter().find(|b| b.0 == "Replace").unwrap().1;
+    e.click(b.center());
+    e.until("replaced toast", |p| p.toasts.iter().any(|t| t == "Replaced 1 in 1 file"));
+    let disk = std::fs::read_to_string(proj.join("src/lib.rs")).unwrap();
+    assert!(disk.starts_with("// delta_marker\npub fn alpha()"), "{disk}");
+    e.until("search re-run", |p| p.search_hits == 0 && p.search_summary == "No results");
     e.app.on_exit();
 }

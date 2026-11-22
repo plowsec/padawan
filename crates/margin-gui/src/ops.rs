@@ -4,17 +4,21 @@ use std::path::PathBuf;
 
 use egui::{pos2, vec2, Id, Key, Order, Rect, Sense};
 use margin_code::Lang;
-use margin_editor::{Document, Wrap};
+use margin_editor::{Document, EditAction, Wrap};
 use margin_proto::limits::MAX_SNIPPET;
 use margin_proto::{ErrCode, Event, IndexPhase, Out, RelPath, Reply, Request, SearchQuery, Site};
 
-use crate::app::{waker, AfterSave, App, DocDone, Loc, Modal, SideTab, Then, BIG_DOC, REINDEX_EVERY};
+use crate::app::{waker, AfterSave, App, DocDone, Loc, Modal, Then, BIG_DOC, REINDEX_EVERY};
 use crate::commands::Cmd;
 use crate::hints::{self, SEG_CALLEES, SEG_CALLERS, SEG_REACH, SEG_SINKS};
+use crate::menubar::MenuPick;
+use crate::search_panel::thousands;
 use crate::palette::{self, Palette, PaletteOut};
+use crate::paths_view::PathsPanel;
 use crate::picker::{Picker, PickerOut};
 use crate::results_panel::ResultsPanel;
 use crate::sanitize::{clean, floor_char, sanitize};
+use crate::side::SideMode;
 use crate::state::FolderTabs;
 use crate::tabs::{Banner, FileTab, TabKind, View};
 use crate::tree::{EditKind, TreeAction};
@@ -22,6 +26,8 @@ use crate::widgets;
 use crate::workspace::{Pending, Workspace};
 
 const SITE_LIMIT: u32 = 2000;
+/// Paths asked for per request.
+pub const PATHS_LIMIT: u32 = 200;
 const MAX_NAV: usize = 100;
 
 fn decode(data: Vec<u8>) -> (String, bool) {
@@ -72,6 +78,11 @@ impl App {
         }
         while let Ok(o) = self.outline_rx.try_recv() {
             self.apply_outline(o);
+        }
+        while let Ok(m) = self.md_rx.try_recv() {
+            if let Some(pv) = self.tabs.file_by_id(m.tab).and_then(|f| f.preview.as_mut()) {
+                pv.apply(m.rev, m.doc);
+            }
         }
     }
 
@@ -194,15 +205,37 @@ impl App {
                     p.req = None;
                 }
             }
-            (Pending::Search, r) => {
-                if self.search.req != Some(id) {
-                    return;
+            (Pending::Names, Reply::FileMatches { items, total_files }) => {
+                if self.side.req == Some(id) {
+                    self.side.req = None;
+                    self.side.set_items(items, total_files);
                 }
+            }
+            (Pending::Names, Reply::Err { msg, code }) => {
+                if self.side.req == Some(id) {
+                    self.side.req = None;
+                    self.side.set_items(Vec::new(), 0);
+                    if code != ErrCode::Cancelled {
+                        self.toasts.error(&msg);
+                    }
+                }
+            }
+            (Pending::Search(tab), r) => {
+                let Some(s) = self.tabs.search_by_id(tab).filter(|s| s.req == Some(id)) else {
+                    if !streaming {
+                        return;
+                    }
+                    // Stale stream (tab closed or re-run): stop tracking it.
+                    if let Some(ws) = self.ws.as_mut() {
+                        ws.pending.remove(&id);
+                    }
+                    return;
+                };
                 match r {
-                    Reply::SearchBatch { hits } => self.search.on_batch(hits),
-                    Reply::SearchDone(s) => self.search.on_done(s),
+                    Reply::SearchBatch { hits } => s.on_batch(hits),
+                    Reply::SearchDone(st) => s.on_done(st),
                     Reply::Err { code: ErrCode::Cancelled, .. } => {}
-                    Reply::Err { msg, .. } => self.search.on_err(&msg),
+                    Reply::Err { msg, .. } => s.on_err(&msg),
                     _ => {}
                 }
                 if !streaming {
@@ -211,6 +244,21 @@ impl App {
                     }
                 }
             }
+            (Pending::Replace(tab), Reply::Replaced { files, replacements, changed, skipped, cancelled }) => self.on_replaced(tab, files, replacements, changed, skipped, cancelled),
+            (Pending::Replace(_), Reply::Err { msg, .. }) => self.toasts.error(&format!("Not replaced: {msg}")),
+            (Pending::Paths(_), Reply::Paths { paths, truncated }) => {
+                if let Some(p) = self.paths.as_mut() {
+                    p.set(paths, truncated);
+                }
+            }
+            (Pending::Paths(_), Reply::Err { msg, .. }) => {
+                if let Some(p) = self.paths.as_mut() {
+                    p.set(Vec::new(), false);
+                }
+                self.toasts.error(&msg);
+            }
+            (Pending::SaveAsDir { tab, path, rest }, r) => self.on_save_as_dir(tab, path, rest, r),
+            (Pending::SaveAs { tab, path, rev }, r) => self.on_save_as(tab, path, rev, r),
             (Pending::Lens { tab, rev }, Reply::Lens { fns }) => {
                 let Some(f) = self.tabs.file_by_id(tab) else { return };
                 if f.hints.outline_rev != Some(rev) {
@@ -237,6 +285,7 @@ impl App {
                     let mut r = ResultsPanel::new(format!("Definitions of {}", sanitize(&name, 60)), self.results_h);
                     r.set(sites, truncated);
                     r.focus = true;
+                    self.paths = None;
                     self.results = Some(r);
                 }
             },
@@ -329,13 +378,19 @@ impl App {
                 f.st.goto(l, c);
             }
         }
+        if f.preview.is_none() && f.markdown() {
+            f.preview = Some(Box::new(crate::md_preview::Preview { on: self.settings.md_preview, ..Default::default() }));
+        }
+        if let Some(frag) = f.pending_anchor.take() {
+            self.jump_anchor(d.tab, &frag);
+        }
     }
 
     // ---- folder ----
 
     /// Open a folder, asking about unsaved tabs first.
     pub(crate) fn open_folder(&mut self, path: PathBuf) {
-        let dirty = self.dirty_tabs();
+        let dirty = self.dirty_file_tabs();
         if dirty.is_empty() {
             self.open_folder_now(path);
         } else {
@@ -345,10 +400,12 @@ impl App {
 
     pub(crate) fn open_folder_now(&mut self, path: PathBuf) {
         self.snapshot_tabs();
-        self.tabs = Default::default();
+        // Untitled buffers belong to no folder: they stay.
+        self.tabs.retain(|t| t.file().is_some_and(FileTab::is_untitled));
         self.tree.clear();
-        self.search = Default::default();
+        self.side = Default::default();
         self.results = None;
+        self.paths = None;
         self.back.clear();
         self.forward.clear();
         self.restored = false;
@@ -407,8 +464,8 @@ impl App {
         if !self.restored || ws.root.is_none() {
             return;
         }
-        let tabs: Vec<String> = self.tabs.list.iter().filter_map(|t| t.file().map(|f| f.path.to_string())).collect();
-        let active = self.tabs.active_file().map(|f| f.path.to_string());
+        let tabs: Vec<String> = self.tabs.list.iter().filter_map(|t| t.file().filter(|f| !f.is_untitled()).map(|f| f.path.to_string())).collect();
+        let active = self.tabs.active_file().filter(|f| !f.is_untitled()).map(|f| f.path.to_string());
         let ft = FolderTabs { root: ws.root_str(), tabs, active };
         if self.state.tabs_of(&ft.root) != Some(&ft) {
             self.state.set_tabs(ft);
@@ -417,7 +474,7 @@ impl App {
     }
 
     pub(crate) fn close_folder(&mut self) {
-        let dirty = self.dirty_tabs();
+        let dirty = self.dirty_file_tabs();
         if !dirty.is_empty() {
             self.modal = Some(Modal::Unsaved { tabs: dirty, then: Then::CloseFolder });
             return;
@@ -427,21 +484,28 @@ impl App {
 
     fn close_folder_now(&mut self) {
         self.snapshot_tabs();
-        self.tabs = Default::default();
+        self.tabs.retain(|t| t.file().is_some_and(FileTab::is_untitled));
         self.tree.clear();
-        self.search = Default::default();
+        self.side = Default::default();
         self.results = None;
+        self.paths = None;
         self.ws = None;
         self.palette = None;
     }
 
-    pub(crate) fn dirty_tabs(&self) -> Vec<u64> {
-        self.tabs.list.iter().filter(|t| t.dirty()).map(|t| t.id).collect()
+    /// Dirty tabs with a file on disk (untitled buffers are kept by hot exit: no prompt for them).
+    pub(crate) fn dirty_file_tabs(&self) -> Vec<u64> {
+        self.tabs.list.iter().filter(|t| t.dirty() && t.file().is_some_and(|f| !f.is_untitled())).map(|t| t.id).collect()
     }
 
-    fn proceed(&mut self, then: Then) {
+    pub(crate) fn proceed(&mut self, then: Then) {
         match then {
             Then::CloseTab(id) => self.close_tab_now(id),
+            Then::CloseTabs(ids) => {
+                for id in ids {
+                    self.close_tab_now(id);
+                }
+            }
             Then::CloseFolder => self.close_folder_now(),
             Then::Open(p) => self.open_folder_now(p),
             Then::Quit => {
@@ -462,14 +526,14 @@ impl App {
         }
     }
 
-    fn refresh_dir(&mut self, d: RelPath) {
+    pub(crate) fn refresh_dir(&mut self, d: RelPath) {
         if d.is_root() || self.tree.expanded.contains(&d) || self.tree.dirs.contains_key(&d) {
             self.list_dir(d);
         }
     }
 
     fn here(&self) -> Option<Loc> {
-        let f = self.tabs.active_file()?;
+        let f = self.tabs.active_file().filter(|f| !f.is_untitled())?;
         let (line, col) = f.st.cursor();
         Some(Loc { path: f.path.clone(), line, col })
     }
@@ -521,6 +585,10 @@ impl App {
 
     pub(crate) fn save_tab(&mut self, id: u64, overwrite: bool) {
         let Some(f) = self.tabs.file_by_id(id) else { return };
+        if f.is_untitled() {
+            self.ask_save_as(id, None);
+            return;
+        }
         let View::Text(doc) = &f.view else { return };
         if doc.read_only() || f.saving.is_some() {
             return;
@@ -536,7 +604,7 @@ impl App {
     }
 
     pub(crate) fn reload_tab(&mut self, id: u64) {
-        let Some(f) = self.tabs.file_by_id(id) else { return };
+        let Some(f) = self.tabs.file_by_id(id).filter(|f| !f.is_untitled()) else { return };
         let path = f.path.clone();
         f.banner = None;
         if let Some(ws) = self.ws.as_mut() {
@@ -553,9 +621,23 @@ impl App {
         }
     }
 
-    fn close_tab_now(&mut self, id: u64) {
+    pub(crate) fn close_tab_now(&mut self, id: u64) {
         if let Some(i) = self.tabs.by_id(id) {
-            self.tabs.remove(i);
+            if let Some(t) = self.tabs.remove(i) {
+                match &t.kind {
+                    TabKind::Search(s) => {
+                        if let (Some(r), Some(ws)) = (s.req, self.ws.as_mut()) {
+                            ws.cancel(r);
+                        }
+                    }
+                    TabKind::File(f) => {
+                        if let Some(n) = f.untitled {
+                            self.persist.remove_untitled(n);
+                        }
+                    }
+                    TabKind::Settings => {}
+                }
+            }
             self.tabs_changed = true;
             self.focus_editor = true;
         }
@@ -585,16 +667,20 @@ impl App {
                 self.ctx.copy_text(abs);
             }
             TreeAction::Error(m) => self.toasts.error(&m),
+            TreeAction::Menu(row, pos) => self.open_tree_menu(row, pos),
         }
     }
 
-    pub(crate) fn start_search(&mut self, q: SearchQuery) {
+    /// Run `q` in search tab `tab` (cancels its running request).
+    pub(crate) fn start_search(&mut self, tab: u64, q: SearchQuery) {
         let Some(ws) = self.ws.as_mut() else { return };
-        if let Some(old) = self.search.req.take() {
+        let Some(s) = self.tabs.list.iter_mut().find(|t| t.id == tab).and_then(|t| t.search_mut()) else { return };
+        if let Some(old) = s.req.take() {
             ws.cancel(old);
         }
-        let id = ws.send(Request::Search { query: q }, Pending::Search);
-        self.search.started(id);
+        s.edited_at = None;
+        let id = ws.send(Request::Search { query: q.clone() }, Pending::Search(tab));
+        s.started(id, q);
     }
 
     // ---- window ----
@@ -608,7 +694,7 @@ impl App {
             self.focus_regained();
         }
         if !focused && self.was_focused && self.settings.autosave {
-            for id in self.dirty_tabs() {
+            for id in self.dirty_file_tabs() {
                 self.save_tab(id, false);
             }
         }
@@ -618,7 +704,7 @@ impl App {
             self.open_folder(p);
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ok {
-            let dirty = self.dirty_tabs();
+            let dirty = self.dirty_file_tabs();
             if dirty.is_empty() {
                 self.quit_ok = true;
             } else {
@@ -635,7 +721,7 @@ impl App {
         let Some(ws) = self.ws.as_mut() else { return };
         for t in &self.tabs.list {
             if let Some(f) = t.file() {
-                if f.meta.is_some() {
+                if f.meta.is_some() && !f.is_untitled() {
                     ws.send(Request::Stat { path: f.path.clone() }, Pending::Stat { tab: t.id });
                 }
             }
@@ -685,8 +771,10 @@ impl App {
     }
 
     pub(crate) fn run_cmd(&mut self, c: Cmd) {
-        let mac = self.mac;
-        let _ = mac;
+        if let Some(a) = edit_action(c) {
+            self.edit(a);
+            return;
+        }
         match c {
             Cmd::Palette => {
                 if self.palette.as_ref().is_some_and(|p| p.mode == palette::Mode::All) {
@@ -695,6 +783,10 @@ impl App {
                     self.picker = None;
                     self.palette = Some(Palette::new(palette::Mode::All, ""));
                 }
+            }
+            Cmd::Shortcuts => {
+                self.picker = None;
+                self.palette = Some(Palette::new(palette::Mode::All, ">"));
             }
             Cmd::GoToFile => {
                 if self.ws.is_some() {
@@ -712,6 +804,7 @@ impl App {
             }
             Cmd::OpenFolder => {
                 self.palette = None;
+                self.modal = None;
                 let mut p = Picker::new();
                 let start = self.ws.as_ref().and_then(|w| PathBuf::from(w.root_str()).parent().map(PathBuf::from));
                 if let Some(s) = &start {
@@ -721,28 +814,38 @@ impl App {
                 self.opener.browse(start.as_deref(), waker(&self.ctx));
             }
             Cmd::CloseFolder => self.close_folder(),
-            Cmd::NewFile | Cmd::NewFolder => {
+            Cmd::NewFile => self.new_untitled(),
+            Cmd::NewWindow => self.opener.new_window(None),
+            Cmd::NewFileInFolder | Cmd::NewFolder => {
                 if self.ws.is_none() {
                     return;
                 }
-                self.state.sidebar_visible = true;
-                self.side = SideTab::Files;
+                self.show_sidebar();
+                self.side.mode = SideMode::Names;
+                self.side.query.clear();
+                self.side.include.clear();
+                self.side.exclude.clear();
                 let dir = self
                     .tree
                     .selected
                     .clone()
-                    .or_else(|| self.tabs.active_file().map(|f| f.path.clone()))
+                    .or_else(|| self.tabs.active_file().filter(|f| !f.is_untitled()).map(|f| f.path.clone()))
                     .map(|p| if self.tree.is_dir(&p) { p } else { p.parent().unwrap_or_default() })
                     .unwrap_or_default();
-                self.tree.start_edit(if c == Cmd::NewFile { EditKind::NewFile(dir) } else { EditKind::NewFolder(dir) });
+                self.tree.start_edit(if c == Cmd::NewFileInFolder { EditKind::NewFile(dir) } else { EditKind::NewFolder(dir) });
             }
             Cmd::Save => {
                 if let Some(id) = self.active_id() {
                     self.save_tab(id, false);
                 }
             }
+            Cmd::SaveAs => {
+                if let Some(id) = self.tabs.active_tab().filter(|t| t.file().is_some_and(|f| f.doc().is_some())).map(|t| t.id) {
+                    self.ask_save_as(id, None);
+                }
+            }
             Cmd::SaveAll => {
-                for id in self.dirty_tabs() {
+                for id in self.dirty_file_tabs() {
                     self.save_tab(id, false);
                 }
             }
@@ -760,6 +863,16 @@ impl App {
                 self.focus_editor = true;
             }
             Cmd::Find | Cmd::Replace => {
+                if let Some(s) = self.tabs.active.and_then(|a| self.tabs.list.get_mut(a)).and_then(|t| t.search_mut()) {
+                    // In a search tab: show its replace row.
+                    s.show_replace = true;
+                    if c == Cmd::Replace {
+                        s.focus_replace = true;
+                    } else {
+                        s.focus_query = true;
+                    }
+                    return;
+                }
                 let seed = self.editor_selection();
                 if let Some(f) = self.tabs.active_file_mut() {
                     f.st.open_find(seed.as_deref(), c == Cmd::Replace);
@@ -776,17 +889,35 @@ impl App {
                     }
                 }
             }
-            Cmd::SearchFolder => {
+            Cmd::SearchFolder | Cmd::ShowFiles => {
                 if self.ws.is_none() {
                     return;
                 }
-                if let Some(s) = self.editor_selection() {
-                    self.search.query = s;
-                    self.search.edited_at = Some(self.now - 1.0);
+                if c == Cmd::SearchFolder {
+                    if let Some(s) = self.editor_selection() {
+                        self.side.query = s;
+                    }
+                    self.side.mode = SideMode::Content;
+                } else {
+                    if self.side.mode != SideMode::Names {
+                        self.side.query.clear();
+                    }
+                    self.side.mode = SideMode::Names;
                 }
-                self.state.sidebar_visible = true;
-                self.side = SideTab::Search;
-                self.search.focus_query = true;
+                self.side.edited_at = Some(self.now - 1.0);
+                self.show_sidebar();
+                self.side.focus = true;
+                // The field wins over a pending editor focus request.
+                self.focus_editor = false;
+                if let Some(f) = self.tabs.active_file_mut() {
+                    f.focus_editor = false;
+                }
+            }
+            Cmd::ReplaceFolder => {
+                if self.ws.is_none() {
+                    return;
+                }
+                self.open_search_tab(None, true);
             }
             Cmd::GoToDef => {
                 let w = self.word_at_cursor.clone();
@@ -816,11 +947,11 @@ impl App {
                 self.state.sidebar_visible = !self.state.sidebar_visible;
                 self.state_at = Some(self.now);
             }
-            Cmd::ShowFiles => {
-                self.state.sidebar_visible = true;
-                self.side = SideTab::Files;
-                self.tree.want_focus = true;
+            Cmd::ToggleMenuBar => {
+                self.settings.menu_bar = !self.settings.menu_bar;
+                self.settings_changed(false);
             }
+            Cmd::MdPreview => self.toggle_preview(),
             Cmd::ToggleWrap => {
                 let prose = self.tabs.active_file().and_then(|f| f.doc()).is_some_and(|d| d.lang().is_prose());
                 self.settings.wrap = match self.settings.wrap {
@@ -864,13 +995,15 @@ impl App {
                 self.settings.zoom = ((z * 10.0).round() / 10.0).clamp(*crate::settings::ZOOM.start(), *crate::settings::ZOOM.end());
                 self.settings_changed(false);
             }
-            Cmd::Settings => {
-                match self.tabs.list.iter().position(|t| matches!(t.kind, TabKind::Settings)) {
-                    Some(i) => self.tabs.activate(i),
-                    None => {
-                        self.tabs.add(TabKind::Settings);
-                    }
+            Cmd::Settings => match self.tabs.list.iter().position(|t| matches!(t.kind, TabKind::Settings)) {
+                Some(i) => self.tabs.activate(i),
+                None => {
+                    self.tabs.add(TabKind::Settings);
                 }
+            },
+            Cmd::About => {
+                self.palette = None;
+                self.modal = Some(Modal::About);
             }
             Cmd::RebuildIndex => {
                 if let Some(ws) = self.ws.as_mut() {
@@ -880,24 +1013,70 @@ impl App {
                 }
             }
             Cmd::RevertFile => {
-                if let Some(id) = self.tabs.active_file().and_then(|_| self.active_id()) {
+                if let Some(id) = self.tabs.active_file().filter(|f| !f.is_untitled()).and_then(|_| self.active_id()) {
                     self.reload_tab(id);
                 }
             }
             Cmd::CopyPath | Cmd::CopyRelPath => {
-                if let (Some(f), Some(ws)) = (self.tabs.active_file(), self.ws.as_ref()) {
+                if let (Some(f), Some(ws)) = (self.tabs.active_file().filter(|f| !f.is_untitled()), self.ws.as_ref()) {
                     let s = if c == Cmd::CopyPath { abs_path(&ws.root_str(), &f.path) } else { f.path.to_string() };
                     self.ctx.copy_text(s);
                 }
             }
             Cmd::Quit => {
-                let dirty = self.dirty_tabs();
+                let dirty = self.dirty_file_tabs();
                 if dirty.is_empty() {
                     self.proceed(Then::Quit);
                 } else {
                     self.modal = Some(Modal::Unsaved { tabs: dirty, then: Then::Quit });
                 }
             }
+            Cmd::Undo | Cmd::Redo | Cmd::Cut | Cmd::Copy | Cmd::Paste | Cmd::SelectAll | Cmd::ToggleComment | Cmd::Indent | Cmd::Outdent | Cmd::DuplicateLine | Cmd::DeleteLine | Cmd::MoveLineUp | Cmd::MoveLineDown => {}
+        }
+    }
+
+    fn show_sidebar(&mut self) {
+        if !self.state.sidebar_visible {
+            self.state.sidebar_visible = true;
+            self.state_at = Some(self.now);
+        }
+    }
+
+    /// Queue an edit command on the active text tab.
+    pub(crate) fn edit(&mut self, a: EditAction) {
+        let Some(f) = self.tabs.active_file_mut().filter(|f| f.doc().is_some()) else { return };
+        f.st.run(a);
+        f.focus_editor = true;
+        if self.edit_log.len() >= 64 {
+            self.edit_log.remove(0);
+        }
+        self.edit_log.push(a);
+        self.ctx.request_repaint();
+    }
+
+    /// Can `c` run now? (menu bar greys the others).
+    pub(crate) fn enabled(&self, c: Cmd) -> bool {
+        let ws = self.ws.is_some();
+        let text = self.tabs.active_file().is_some_and(|f| f.doc().is_some());
+        let file = self.tabs.active_file().is_some_and(|f| !f.is_untitled() && f.doc().is_some());
+        let editable = self.tabs.active_file().and_then(|f| f.doc()).is_some_and(|d| !d.read_only());
+        match c {
+            Cmd::Undo => editable && self.tabs.active_file().and_then(|f| f.doc()).is_some_and(Document::can_undo),
+            Cmd::Redo => editable && self.tabs.active_file().and_then(|f| f.doc()).is_some_and(Document::can_redo),
+            Cmd::Cut | Cmd::Paste | Cmd::ToggleComment | Cmd::Indent | Cmd::Outdent | Cmd::DuplicateLine | Cmd::DeleteLine | Cmd::MoveLineUp | Cmd::MoveLineDown => editable,
+            Cmd::Copy | Cmd::SelectAll | Cmd::Find | Cmd::FindNext | Cmd::FindPrev | Cmd::GoToLine | Cmd::GoToSymbol | Cmd::SaveAs => text,
+            Cmd::Replace => text || self.tabs.active_tab().is_some_and(|t| t.search().is_some()),
+            Cmd::Save => self.tabs.active_tab().is_some_and(|t| t.dirty()),
+            Cmd::SaveAll => !self.dirty_file_tabs().is_empty(),
+            Cmd::RevertFile | Cmd::CopyPath | Cmd::CopyRelPath => file,
+            Cmd::CloseTab | Cmd::NextTab | Cmd::PrevTab => !self.tabs.list.is_empty(),
+            Cmd::CloseFolder | Cmd::GoToFile | Cmd::SearchFolder | Cmd::ReplaceFolder | Cmd::ShowFiles | Cmd::RebuildIndex | Cmd::NewFileInFolder | Cmd::NewFolder => ws,
+            Cmd::GoToDef | Cmd::FindCallers => ws && text,
+            Cmd::Back => !self.back.is_empty(),
+            Cmd::Forward => !self.forward.is_empty(),
+            Cmd::MdPreview => self.tabs.active_file().is_some_and(|f| f.doc().is_some() && f.markdown()),
+            Cmd::ToggleSidebar => ws,
+            _ => true,
         }
     }
 
@@ -922,13 +1101,27 @@ impl App {
         }
     }
 
-    fn find_callers(&mut self, word: String) {
+    /// Call paths from function `name` to sinks → paths view.
+    pub(crate) fn open_paths(&mut self, name: String) {
+        if name.is_empty() || self.ws.is_none() {
+            return;
+        }
+        let w: String = name.chars().take(200).collect();
+        self.results = None;
+        self.paths = Some(PathsPanel::new(&w, self.results_h));
+        if let Some(ws) = self.ws.as_mut() {
+            ws.send(Request::Paths { name: w.clone(), sink: String::new(), limit: PATHS_LIMIT }, Pending::Paths(w));
+        }
+    }
+
+    pub(crate) fn find_callers(&mut self, word: String) {
         if word.is_empty() || self.ws.is_none() {
             return;
         }
         let w: String = word.chars().take(200).collect();
         let mut r = ResultsPanel::new(format!("Callers of {}", sanitize(&w, 60)), self.results_h);
         r.focus = true;
+        self.paths = None;
         self.results = Some(r);
         if let Some(ws) = self.ws.as_mut() {
             ws.send(Request::Callers { name: w.clone(), limit: SITE_LIMIT }, Pending::Callers(w));
@@ -955,22 +1148,15 @@ impl App {
         };
         match seg {
             SEG_CALLERS => self.find_callers(name),
-            SEG_CALLEES | SEG_SINKS => {
-                let sites = local(seg == SEG_SINKS);
-                let title = if seg == SEG_SINKS { format!("Sinks in {}", sanitize(&name, 60)) } else { format!("Calls in {}", sanitize(&name, 60)) };
-                let mut r = ResultsPanel::new(title, self.results_h);
+            SEG_CALLEES => {
+                let sites = local(false);
+                let mut r = ResultsPanel::new(format!("Calls in {}", sanitize(&name, 60)), self.results_h);
                 r.set(sites, false);
                 r.focus = true;
+                self.paths = None;
                 self.results = Some(r);
             }
-            SEG_REACH => {
-                let mut r = ResultsPanel::new(format!("Sinks reachable from {}", sanitize(&name, 60)), self.results_h);
-                r.focus = true;
-                self.results = Some(r);
-                if let Some(ws) = self.ws.as_mut() {
-                    ws.send(Request::Reach { name: name.clone(), limit: SITE_LIMIT }, Pending::Reach(name));
-                }
-            }
+            SEG_SINKS | SEG_REACH => self.open_paths(name),
             _ => {}
         }
     }
@@ -1043,6 +1229,8 @@ impl App {
     pub(crate) fn overlays(&mut self, ctx: &egui::Context) {
         let t = self.theme;
         if self.modal.is_some() {
+            self.ctx_menu = None;
+            self.menubar.close();
             self.modal_ui(ctx);
             return;
         }
@@ -1075,6 +1263,8 @@ impl App {
             return;
         }
         if self.palette.is_some() {
+            self.ctx_menu = None;
+            self.menubar.close();
             let outline = self.tabs.active_file().and_then(|f| f.hints.outline.clone());
             let has_tab = self.tabs.active_file().is_some_and(|f| f.doc().is_some());
             let mru = self.mru.clone();
@@ -1091,34 +1281,88 @@ impl App {
                 PaletteOut::Line(l) => self.jump_here(l, 0),
                 PaletteOut::Symbol(l, c) => self.jump_here(l, c),
             }
+            return;
+        }
+        if self.ctx_menu.is_some() {
+            self.menubar.close();
+            self.ctx_menu_ui(ctx);
+            return;
+        }
+        if self.menubar.is_open() {
+            let recent = self.state.recent.clone();
+            let mut mb = std::mem::take(&mut self.menubar);
+            let enabled = |c: Cmd| self.enabled(c);
+            let pick = mb.popup(ctx, &t, self.mac, &enabled, &recent, self.frame);
+            self.menubar = mb;
+            match pick {
+                Some(MenuPick::Cmd(c)) => {
+                    self.note_mru(c);
+                    self.run_cmd(c);
+                }
+                Some(MenuPick::Recent(p)) => self.open_folder(PathBuf::from(p)),
+                None => {}
+            }
         }
     }
 
     fn jump_here(&mut self, line: u32, col: u32) {
-        let Some(p) = self.tabs.active_file().map(|f| f.path.clone()) else { return };
+        let Some(f) = self.tabs.active_file_mut() else { return };
+        if f.is_untitled() {
+            f.st.goto(line, col);
+            f.focus_editor = true;
+            return;
+        }
+        let p = f.path.clone();
         self.open_file(p, Some((line, col, 0)), true);
     }
 
     fn modal_ui(&mut self, ctx: &egui::Context) {
         let t = self.theme;
         let Some(m) = self.modal.clone() else { return };
-        let (title, body, buttons): (String, String, Vec<&str>) = match &m {
+        // (title, body, buttons, button Enter picks, button Esc picks)
+        let (title, body, buttons, enter_pick): (String, String, Vec<&str>, Option<usize>) = match &m {
             Modal::Unsaved { tabs, then } => {
                 let names: Vec<String> = tabs.iter().filter_map(|id| self.tabs.by_id(*id)).map(|i| self.tabs.list[i].title()).collect();
+                let untitled = tabs.len() == 1 && tabs.iter().any(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().is_some_and(FileTab::is_untitled)));
                 let title = if names.len() == 1 { format!("Save changes to {}?", names[0]) } else { format!("Save changes to {} files?", names.len()) };
                 let what = match then {
                     Then::Quit => "before quitting",
-                    Then::CloseTab(_) => "before closing",
+                    Then::CloseTab(_) | Then::CloseTabs(_) => "before closing",
                     Then::CloseFolder | Then::Open(_) => "before closing the folder",
                 };
-                let body = if names.len() > 1 { format!("{} — {what}.", names.join(", ")) } else { format!("Unsaved edits are lost if you don't save them {what}.") };
-                (title, body, vec!["Save", "Don't Save", "Cancel"])
+                if untitled {
+                    (title, "This buffer is not saved to a file. Discarded text cannot be recovered.".to_owned(), vec!["Save…", "Discard", "Cancel"], Some(0))
+                } else {
+                    let body = if names.len() > 1 { format!("{} — {what}.", names.join(", ")) } else { format!("Unsaved edits are lost if you don't save them {what}.") };
+                    (title, body, vec!["Save", "Don't Save", "Cancel"], Some(0))
+                }
             }
             Modal::Delete { path, dir } => {
                 let name = clean(path.name());
                 let body = if *dir { "The folder must be empty. This cannot be undone.".to_owned() } else { "This cannot be undone.".to_owned() };
-                (format!("Delete {name}?"), body, vec!["Delete", "Cancel"])
+                (format!("Delete {name}?"), body, vec!["Delete", "Cancel"], Some(0))
             }
+            Modal::Replace { hits, files, with, .. } => {
+                let m = if *hits == 1 { "match".to_owned() } else { "matches".to_owned() };
+                let f = if *files == 1 { "file" } else { "files" };
+                let title = if with.is_empty() {
+                    format!("Delete {} {m} in {} {f}?", thousands(*hits as u64), thousands(*files as u64))
+                } else {
+                    format!("Replace {} {m} in {} {f} with “{}”?", thousands(*hits as u64), thousands(*files as u64), sanitize(with, 40))
+                };
+                // Enter does not confirm: Cancel is the default.
+                (title, "Files on disk are rewritten. This cannot be undone.".to_owned(), vec!["Replace", "Cancel"], Some(1))
+            }
+            Modal::SaveAs(_) if self.ws.is_none() => ("Save As".to_owned(), "No folder is open. Open a folder to save into it.".to_owned(), vec!["Open Folder…", "Cancel"], Some(0)),
+            Modal::SaveAs(_) => ("Save As".to_owned(), "Path inside the folder.".to_owned(), vec!["Save", "Cancel"], Some(0)),
+            Modal::About => {
+                let body = format!("Version {}\nWindow sandbox: {}\nEngine sandbox: {}", env!("CARGO_PKG_VERSION"), sanitize(&self.gui_sandbox, 40), sanitize(self.opener.sandbox(), 40));
+                ("Margin".to_owned(), body, vec!["Close"], Some(0))
+            }
+        };
+        let save_as = match &m {
+            Modal::SaveAs(s) if self.ws.is_some() => Some(s.clone()),
+            _ => None,
         };
         let screen = ctx.content_rect();
         egui::Area::new(Id::unique("modal-scrim")).order(Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
@@ -1126,62 +1370,173 @@ impl App {
             ui.interact(screen, Id::unique("modal-scrim-hit"), Sense::click());
         });
         let (enter, esc) = ctx.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, Key::Enter), i.consume_key(egui::Modifiers::NONE, Key::Escape)));
-        let w = 420.0f32.min(screen.width() - 32.0);
+        let w = 440.0f32.min(screen.width() - 32.0);
+        let title_g = ctx.fonts_mut(|f| f.layout(title.clone(), egui::FontId::proportional(t.look.ui_size + 1.0), t.ui.text_strong, w - 48.0));
         let body_g = ctx.fonts_mut(|f| f.layout(body.clone(), t.font_ui(), t.ui.text, w - 48.0));
-        let h = 24.0 + 24.0 + 10.0 + body_g.size().y + 24.0 + t.row_h() + 2.0 + 20.0;
+        let field_h = if save_as.is_some() { t.row_h() + 6.0 + 10.0 + t.row_h() } else { 0.0 };
+        let h = 24.0 + title_g.size().y + 10.0 + body_g.size().y + field_h + 24.0 + t.row_h() + 2.0 + 20.0;
         let pos = pos2((screen.center().x - w / 2.0).round(), (screen.top() + screen.height() * 0.28).round());
         let rect = Rect::from_min_size(pos, vec2(w, h));
         let mut clicked: Option<usize> = None;
+        let mut text = save_as.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+        let mut field_enter = false;
+        let mut want_focus = save_as.as_ref().is_some_and(|s| s.focus);
+        let busy = save_as.as_ref().is_some_and(|s| s.busy);
+        let mut live_error: Option<String> = None;
+        let mut seen = Vec::new();
         egui::Area::new(Id::unique("modal")).order(Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
             let p = ui.painter().clone();
             p.add(ctx.global_style().visuals.window_shadow.as_shape(rect, 6));
             p.rect_filled(rect, 6.0, t.ui.overlay_bg);
             p.rect_stroke(rect, 6.0, t.border(), egui::StrokeKind::Inside);
             ui.interact(rect, Id::unique("modal-body"), Sense::click());
-            let tr = Rect::from_min_size(rect.min + vec2(24.0, 24.0), vec2(w - 48.0, 24.0));
-            widgets::text_at(ui, tr, tr.left(), &title, egui::FontId::proportional(t.look.ui_size + 1.0), t.ui.text_strong);
-            p.galley(pos2(rect.left() + 24.0, tr.bottom() + 10.0), body_g, t.ui.text);
+            let ty = rect.top() + 24.0;
+            let tg_h = title_g.size().y;
+            p.galley(pos2(rect.left() + 24.0, ty), title_g, t.ui.text_strong);
+            let by = ty + tg_h + 10.0;
+            let bg_h = body_g.size().y;
+            p.galley(pos2(rect.left() + 24.0, by), body_g, t.ui.text_muted);
+            if let Some(sa) = &save_as {
+                let fr = Rect::from_min_size(pos2(rect.left() + 24.0, by + bg_h + 10.0), vec2(w - 48.0, t.row_h() + 6.0));
+                let resp = widgets::field(ui, fr, save_as_id(), &mut text, "notes/idea.md", &t, t.font_mono_ui());
+                if want_focus {
+                    resp.request_focus();
+                    widgets::cursor_to_end(ctx, save_as_id(), &text);
+                    want_focus = false;
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    field_enter = true;
+                }
+                live_error = save_as_check(&text).err().or_else(|| if text == sa.text { sa.error.clone() } else { None });
+                let er = Rect::from_min_size(pos2(fr.left(), fr.bottom() + 6.0), vec2(fr.width(), t.row_h()));
+                if let Some(e) = &live_error {
+                    widgets::text_at(ui, er, er.left(), e, t.font_small(), t.ui.error);
+                } else if busy {
+                    widgets::text_at(ui, er, er.left(), "Saving…", t.font_small(), t.ui.text_muted);
+                }
+            }
             let br = Rect::from_min_max(pos2(rect.left() + 24.0, rect.bottom() - 20.0 - t.row_h() - 2.0), pos2(rect.right() - 24.0, rect.bottom() - 20.0));
             let mut b = ui.new_child(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::right_to_left(egui::Align::Center)));
             b.spacing_mut().item_spacing = vec2(8.0, 0.0);
             for (i, label) in buttons.iter().enumerate() {
                 let resp = if i == 0 { widgets::primary_button(&mut b, label, &t) } else { widgets::quiet_button(&mut b, label, &t) };
+                seen.push(((*label).to_owned(), resp.rect));
                 if resp.clicked() {
                     clicked = Some(i);
                 }
             }
         });
-        let pick = clicked.or(if enter { Some(0) } else { None }).or(if esc { Some(buttons.len() - 1) } else { None });
+        self.modal_seen = (title.clone(), seen);
+        if let (Some(Modal::SaveAs(s)), Some(_)) = (self.modal.as_mut(), &save_as) {
+            if s.text != text {
+                s.text = text;
+                s.error = None;
+            }
+            s.focus = want_focus;
+        }
+        let enter = enter || field_enter;
+        let pick = clicked.or(if enter { enter_pick } else { None }).or(if esc { Some(buttons.len() - 1) } else { None });
         let Some(pick) = pick else { return };
-        self.modal = None;
         match m {
-            Modal::Unsaved { tabs, then } => match pick {
-                0 => {
-                    let tabs: Vec<u64> = tabs.into_iter().filter(|id| self.tabs.list.iter().any(|t| t.id == *id && t.dirty())).collect();
-                    // Read-only buffers cannot be saved: they count as done.
-                    let saveable: Vec<u64> = tabs.iter().copied().filter(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().and_then(|f| f.doc()).is_some_and(|d| !d.read_only()))).collect();
-                    if saveable.is_empty() {
-                        self.proceed(then);
-                    } else {
-                        for id in &saveable {
-                            self.save_tab(*id, false);
-                        }
-                        self.after_save = Some(AfterSave { waiting: saveable, then });
-                    }
+            Modal::SaveAs(sa) => {
+                if pick != 0 {
+                    self.modal = None;
+                    self.focus_editor = true;
+                } else if self.ws.is_none() {
+                    self.modal = None;
+                    self.run_cmd(Cmd::OpenFolder);
+                } else if !busy && live_error.is_none() {
+                    self.save_as_submit(sa.tab);
                 }
-                1 => self.proceed(then),
-                _ => {}
-            },
+                return;
+            }
+            Modal::About => {
+                self.modal = None;
+            }
+            Modal::Unsaved { tabs, then } => {
+                self.modal = None;
+                let untitled = tabs.len() == 1 && tabs.iter().any(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().is_some_and(FileTab::is_untitled)));
+                match pick {
+                    0 if untitled => {
+                        if let Some(id) = tabs.first() {
+                            self.ask_save_as(*id, Some(then));
+                        }
+                        return;
+                    }
+                    0 => {
+                        let tabs: Vec<u64> = tabs.into_iter().filter(|id| self.tabs.list.iter().any(|t| t.id == *id && t.dirty())).collect();
+                        // Read-only buffers cannot be saved: they count as done.
+                        let saveable: Vec<u64> = tabs.iter().copied().filter(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().and_then(|f| f.doc()).is_some_and(|d| !d.read_only()))).collect();
+                        if saveable.is_empty() {
+                            self.proceed(then);
+                        } else {
+                            for id in &saveable {
+                                self.save_tab(*id, false);
+                            }
+                            self.after_save = Some(AfterSave { waiting: saveable, then });
+                        }
+                    }
+                    1 => self.proceed(then),
+                    _ => {}
+                }
+            }
             Modal::Delete { path, .. } => {
+                self.modal = None;
                 if pick == 0 {
                     if let Some(ws) = self.ws.as_mut() {
                         ws.send(Request::Delete { path: path.clone() }, Pending::Deleted(path));
                     }
                 }
             }
+            Modal::Replace { tab, only, .. } => {
+                self.modal = None;
+                if pick == 0 {
+                    self.send_replace(tab, only);
+                }
+                return;
+            }
         }
         self.focus_editor = true;
     }
+}
+
+pub fn save_as_id() -> Id {
+    Id::unique("save-as-path")
+}
+
+/// Path typed in Save As → a file path inside the folder.
+pub fn save_as_check(text: &str) -> Result<RelPath, String> {
+    let s = text.trim();
+    if s.is_empty() {
+        return Err("Type a path, e.g. notes/idea.md".to_owned());
+    }
+    if s.ends_with('/') {
+        return Err("That is a folder: add a file name".to_owned());
+    }
+    match RelPath::new(s) {
+        Ok(p) if !p.is_root() => Ok(p),
+        _ => Err("Not a path inside the folder".to_owned()),
+    }
+}
+
+/// The editor command behind a menu / palette command.
+pub fn edit_action(c: Cmd) -> Option<EditAction> {
+    Some(match c {
+        Cmd::Undo => EditAction::Undo,
+        Cmd::Redo => EditAction::Redo,
+        Cmd::Cut => EditAction::Cut,
+        Cmd::Copy => EditAction::Copy,
+        Cmd::Paste => EditAction::Paste,
+        Cmd::SelectAll => EditAction::SelectAll,
+        Cmd::ToggleComment => EditAction::ToggleComment,
+        Cmd::Indent => EditAction::Indent,
+        Cmd::Outdent => EditAction::Outdent,
+        Cmd::DuplicateLine => EditAction::DuplicateLine,
+        Cmd::DeleteLine => EditAction::DeleteLine,
+        Cmd::MoveLineUp => EditAction::MoveLineUp,
+        Cmd::MoveLineDown => EditAction::MoveLineDown,
+        _ => return None,
+    })
 }
 
 /// Absolute path of `p` under `root` (display / clipboard only; never used for I/O).

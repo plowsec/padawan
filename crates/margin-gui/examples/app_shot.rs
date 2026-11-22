@@ -7,8 +7,11 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use common::{Script, H};
-use egui::{Key, Modifiers};
+use egui::{Event, Key, Modifiers, PointerButton, Pos2};
+use margin_proto::{CallPath, FlowArg, Hop, RelPath, Site};
 
 const PARSER_C: &str = r#"/* Tiny HTTP header parser. */
 #include <stdio.h>
@@ -61,6 +64,54 @@ int main(int argc, char **argv) {
 }
 "#;
 
+const NOTES_MD: &str = "# Notes\n\nHow the parser handles **untrusted** headers.\n\n## Checklist\n\n- [x] reject lines without a colon\n- [ ] bound `memcpy` by `MAX_HEADER`\n- [ ] drop `system()` in `run_hook`\n\n## Example\n\n```c\nstruct header h;\nparse_header(\"Host: a\", &h);\n```\n\n> `strcpy` copies without a bound. See [the parser](../src/parser.c).\n\n| Sink | Kind |\n|---|---|\n| memcpy | memory |\n| system | exec |\n";
+
+fn site(path: &str, line: u32, text: &str, col: u32, len: u32, ctx: &str) -> Site {
+    Site { path: RelPath::new(path).unwrap(), line, col, len, text: text.into(), text_col: col, context: ctx.into() }
+}
+
+fn arg(text: &str, from: &[&str]) -> FlowArg {
+    FlowArg { text: text.into(), from: from.iter().map(|s| s.to_string()).collect() }
+}
+
+/// Paths from parse_header (as the engine would send them).
+fn paths() -> Vec<CallPath> {
+    let p = "src/parser.c";
+    vec![
+        CallPath {
+            sink: "memcpy".into(),
+            kind: "memory".into(),
+            hops: vec![Hop { site: site(p, 38, "    memcpy(out->name, line, n);", 4, 6, "parse_header"), args: vec![arg("out->name", &["out"]), arg("line", &["line"]), arg("n", &["colon", "line"])] }],
+            flows: true,
+        },
+        CallPath {
+            sink: "strcpy".into(),
+            kind: "memory".into(),
+            hops: vec![Hop { site: site(p, 40, "    strcpy(out->value, colon + 2);", 4, 6, "parse_header"), args: vec![arg("out->value", &["out"]), arg("colon + 2", &["colon"])] }],
+            flows: true,
+        },
+        CallPath {
+            sink: "system".into(),
+            kind: "exec".into(),
+            hops: vec![
+                Hop { site: site(p, 55, "            run_hook(&h);", 12, 8, "main"), args: vec![arg("&h", &["h"])] },
+                Hop { site: site(p, 46, "    sprintf(cmd, \"notify %s\", h->value);", 4, 7, "run_hook"), args: vec![arg("cmd", &[]), arg("\"notify %s\"", &[]), arg("h->value", &["h"])] },
+                Hop { site: site(p, 47, "    return system(cmd);", 11, 6, "run_hook"), args: vec![arg("cmd", &["cmd"])] },
+            ],
+            flows: false,
+        },
+    ]
+}
+
+fn right_click(a: &mut H, pos: Pos2) {
+    a.shot.move_to([pos.x, pos.y]);
+    a.frames(1);
+    a.shot.event(Event::PointerButton { pos, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+    a.frames(1);
+    a.shot.event(Event::PointerButton { pos, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+    a.frames(2);
+}
+
 fn files() -> Vec<(&'static str, &'static str)> {
     vec![
         ("README.md", "# parser-c\n\nA tiny header parser.\n"),
@@ -70,7 +121,7 @@ fn files() -> Vec<(&'static str, &'static str)> {
         ("src/net/socket.h", "int open_socket(int port);\n"),
         ("src/util.h", "#pragma once\n"),
         ("tests/test_parser.c", "int test_parse(void) {\n    struct header h;\n    return parse_header(\"a: b\", &h);\n}\n"),
-        ("docs/notes.md", "Notes\n"),
+        ("docs/notes.md", NOTES_MD),
         ("target/out.o", "\0\0\0"),
         ("build.log", "log\n"),
     ]
@@ -143,25 +194,114 @@ fn shots(out: &Path, mode: &str, suffix: &str, scale: f32, size: [f32; 2], setti
     a.png_to(&name("07-results"));
     a.key(Key::Escape, Modifiers::NONE);
 
-    // Search.
+    // Search box in Content mode (sidebar), then Enter: a search tab.
     a.key(Key::F, Modifiers::COMMAND | Modifiers::SHIFT);
     a.type_text("header");
-    a.until("search hits", |p| p.search_hits > 0);
     a.frames(3);
     a.png_to(&name("04-search"));
+    a.key(Key::Enter, Modifiers::NONE);
+    a.until("search hits", |p| p.search_hits > 0 && p.search_summary.contains("ms"));
+    a.frames(3);
+    a.png_to(&name("08-search-tab"));
+
+    // Replace row + confirm.
+    let tab = a.probe().search_tab.unwrap();
+    a.click_id(margin_gui::search_panel::replace_toggle_id(tab));
+    a.type_text("hdr");
+    a.frames(2);
+    a.click_id(margin_gui::search_panel::replace_all_id(tab));
+    a.until("confirm", |p| p.modal_title.is_some());
+    a.frames(3);
+    a.png_to(&name("09-replace-confirm"));
+    a.key(Key::Escape, Modifiers::NONE);
 
     // Settings.
     a.key(Key::Comma, Modifiers::COMMAND);
     a.frames(4);
     a.png_to(&name("05-settings"));
+
+    // Names filter with include / exclude.
+    let mut a = H::build(&files(), Script::default(), Some("/home/me/dev/parser-c"), size, scale, &conf);
+    a.opened();
+    a.app_open("src/parser.c");
+    a.key(Key::E, Modifiers::COMMAND | Modifiers::SHIFT);
+    a.type_text("*.c");
+    a.click_id(margin_gui::side::filters_id());
+    a.click_id(margin_gui::side::glob_id(1));
+    a.type_text("tests/**");
+    a.until("names", |p| p.side_list.len() == 2);
+    a.click_id(margin_gui::side::field_id());
+    a.key(Key::ArrowDown, Modifiers::NONE);
+    a.frames(3);
+    a.png_to(&name("10-names-filter"));
+
+    // Call paths (sinks: lens).
+    let script = Script { paths_override: Some(Arc::new(paths())), ..Default::default() };
+    let mut a = H::build(&files(), script, Some("/home/me/dev/parser-c"), size, scale, &conf);
+    a.opened();
+    a.app_open("src/parser.c");
+    a.until("sinks hint", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks"))));
+    a.frames(5);
+    let p = a.probe();
+    let (line, segs) = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).cloned().unwrap();
+    let k = segs.iter().position(|s| s.starts_with("sinks")).unwrap();
+    a.click_id(p.editor_id.unwrap().with(("lens", line, k)));
+    a.until("paths", |p| p.paths == 3);
+    a.key(Key::ArrowDown, Modifiers::NONE);
+    a.frames(3);
+    a.png_to(&name("11-paths"));
+    a.key(Key::Escape, Modifiers::NONE);
+
+    // Menu bar: File open, one item selected.
+    a.click_id(margin_gui::menubar::title_id(0));
+    a.key(Key::ArrowDown, Modifiers::NONE);
+    a.key(Key::ArrowDown, Modifiers::NONE);
+    a.frames(2);
+    a.png_to(&name("12-menu-open"));
+    a.key(Key::Escape, Modifiers::NONE);
+
+    // Tree context menu.
+    let i = a.probe().tree.iter().position(|(p, _)| p == "src").unwrap();
+    let r = a.rect_of(margin_gui::tree::tree_id().with(("row", i))).unwrap();
+    right_click(&mut a, r.center());
+    a.key(Key::ArrowDown, Modifiers::NONE);
+    a.frames(2);
+    a.png_to(&name("13-context-menu"));
+    a.key(Key::Escape, Modifiers::NONE);
+
+    // Untitled + Save As.
+    a.key(Key::N, Modifiers::COMMAND);
+    a.frames(1);
+    a.type_text("idea: bound every copy by MAX_HEADER");
+    a.key(Key::S, Modifiers::COMMAND);
+    a.until("save as", |p| p.modal.as_deref() == Some("save-as"));
+    a.frames(1);
+    a.type_text("notes/");
+    a.frames(3);
+    a.png_to(&name("14-untitled-save-as"));
+    a.key(Key::Escape, Modifiers::NONE);
+
+    // Markdown preview.
+    a.app_open("docs/notes.md");
+    a.key(Key::V, Modifiers::COMMAND | Modifiers::SHIFT);
+    a.until("preview", |p| p.preview_parsed);
+    a.frames(4);
+    a.png_to(&name("15-md-preview"));
 }
 
 trait Drive {
     fn app_open(&mut self, path: &str);
+    fn click_id(&mut self, id: egui::Id);
     fn app_cmd_callers(&mut self, name: &str);
 }
 
 impl Drive for H {
+    fn click_id(&mut self, id: egui::Id) {
+        self.frames(1);
+        let r = self.rect_of(id).unwrap_or_else(|| panic!("no widget {id:?}"));
+        self.click(r.center());
+    }
+
     /// Through the palette's Go to File, like a user.
     fn app_open(&mut self, path: &str) {
         self.key(Key::T, Modifiers::COMMAND);

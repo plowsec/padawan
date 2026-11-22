@@ -1,14 +1,17 @@
 //! Open tabs: file tabs (document + view state + disk metadata) and the Settings tab; the tab strip.
 //!
 //! Strip: flat; active tab = editor background + 2 px accent line on top; dirty = dot in the close slot;
-//! × on hover; middle-click closes; same names get a muted parent-directory suffix; scrolls horizontally.
+//! × on hover; middle-click closes; right-click: context menu; same names get a muted parent-directory suffix;
+//! scrolls horizontally. Untitled tabs (`Untitled-N`) have no path (`RelPath::root()`) until saved.
 
 use egui::{pos2, vec2, CursorIcon, Id, Rect, Sense, Ui};
 use margin_editor::{Document, EditorState, Lens};
 use margin_proto::{Meta, RelPath, ReqId};
 use margin_theme::Theme;
 
+use crate::md_preview::Preview;
 use crate::sanitize::clean;
+use crate::search_panel::SearchPanel;
 use crate::widgets;
 
 pub enum View {
@@ -55,6 +58,23 @@ pub struct FileTab {
     /// Cursor/selection to apply when the content arrives.
     pub pending_select: Option<(u32, u32, u32)>,
     pub focus_editor: bool,
+    /// `Some(n)`: `Untitled-n`, not on disk; `path` is the root.
+    pub untitled: Option<u32>,
+    pub hot: HotExit,
+    pub preview: Option<Box<Preview>>,
+    /// `#fragment` to jump to once a Markdown file loads.
+    pub pending_anchor: Option<String>,
+}
+
+/// Hot-exit bookkeeping of an untitled tab.
+#[derive(Default)]
+pub struct HotExit {
+    /// Revision written to `<config>/untitled/` (or found there at start).
+    pub written: Option<u64>,
+    pub seen_rev: Option<u64>,
+    pub changed_at: f64,
+    /// Too large / too many: kept in memory only (the user was told once).
+    pub memory_only: bool,
 }
 
 impl FileTab {
@@ -70,7 +90,23 @@ impl FileTab {
             hints: HintState::default(),
             pending_select: None,
             focus_editor: true,
+            untitled: None,
+            hot: HotExit::default(),
+            preview: None,
+            pending_anchor: None,
         }
+    }
+
+    /// `Untitled-n` with `text` (plain text until saved).
+    pub fn untitled(n: u32, text: &str) -> FileTab {
+        let mut f = FileTab::new(RelPath::root());
+        f.untitled = Some(n);
+        f.view = View::Text(Box::new(Document::new(text, margin_code::Lang::Plain)));
+        f
+    }
+
+    pub fn is_untitled(&self) -> bool {
+        self.untitled.is_some()
     }
 
     pub fn doc(&self) -> Option<&Document> {
@@ -80,14 +116,31 @@ impl FileTab {
         }
     }
 
+    /// Untitled: has text. File: edited since saved.
     pub fn dirty(&self) -> bool {
-        self.doc().is_some_and(Document::is_dirty)
+        match self.untitled {
+            Some(_) => self.doc().is_some_and(|d| d.len_bytes() > 0),
+            None => self.doc().is_some_and(Document::is_dirty),
+        }
+    }
+
+    pub fn title(&self) -> String {
+        match self.untitled {
+            Some(n) => format!("Untitled-{n}"),
+            None => clean(self.path.name()),
+        }
+    }
+
+    /// Markdown, or an untitled buffer (previewable as Markdown).
+    pub fn markdown(&self) -> bool {
+        self.is_untitled() || self.doc().is_some_and(|d| d.lang() == margin_code::Lang::Markdown)
     }
 }
 
 pub enum TabKind {
     File(Box<FileTab>),
     Settings,
+    Search(Box<SearchPanel>),
 }
 
 pub struct Tab {
@@ -99,14 +152,28 @@ impl Tab {
     pub fn file(&self) -> Option<&FileTab> {
         match &self.kind {
             TabKind::File(f) => Some(f),
-            TabKind::Settings => None,
+            _ => None,
+        }
+    }
+
+    pub fn search(&self) -> Option<&SearchPanel> {
+        match &self.kind {
+            TabKind::Search(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn search_mut(&mut self) -> Option<&mut SearchPanel> {
+        match &mut self.kind {
+            TabKind::Search(s) => Some(s),
+            _ => None,
         }
     }
 
     pub fn file_mut(&mut self) -> Option<&mut FileTab> {
         match &mut self.kind {
             TabKind::File(f) => Some(f),
-            TabKind::Settings => None,
+            _ => None,
         }
     }
 
@@ -116,8 +183,9 @@ impl Tab {
 
     pub fn title(&self) -> String {
         match &self.kind {
-            TabKind::File(f) => clean(f.path.name()),
+            TabKind::File(f) => f.title(),
             TabKind::Settings => "Settings".into(),
+            TabKind::Search(s) => s.title(),
         }
     }
 }
@@ -133,6 +201,12 @@ pub struct Tabs {
 pub enum StripAction {
     Activate(usize),
     Close(usize),
+    /// Right-click: context menu at the pointer.
+    Menu(usize, egui::Pos2),
+}
+
+pub fn tab_id(id: u64) -> Id {
+    Id::unique(("tab", id))
 }
 
 impl Tabs {
@@ -166,8 +240,25 @@ impl Tabs {
         Some(t)
     }
 
+    /// Tab id the next `add` will use.
+    pub fn next_id(&self) -> u64 {
+        self.next_id + 1
+    }
+
+    /// Keep only tabs matching `keep` (ids keep counting up).
+    pub fn retain(&mut self, keep: impl Fn(&Tab) -> bool) {
+        let active = self.active_tab().map(|t| t.id);
+        self.list.retain(|t| keep(t));
+        self.active = active.and_then(|a| self.by_id(a)).or(if self.list.is_empty() { None } else { Some(0) });
+        self.reveal_active = true;
+    }
+
     pub fn find_file(&self, p: &RelPath) -> Option<usize> {
-        self.list.iter().position(|t| t.file().is_some_and(|f| &f.path == p))
+        self.list.iter().position(|t| t.file().is_some_and(|f| !f.is_untitled() && &f.path == p))
+    }
+
+    pub fn search_by_id(&mut self, id: u64) -> Option<&mut SearchPanel> {
+        self.list.iter_mut().find(|t| t.id == id).and_then(Tab::search_mut)
     }
 
     pub fn by_id(&self, id: u64) -> Option<usize> {
@@ -200,8 +291,8 @@ impl Tabs {
 
     /// Muted suffix (parent directory name) for tabs whose names collide.
     fn suffix(&self, i: usize) -> Option<String> {
-        let f = self.list[i].file()?;
-        let dup = self.list.iter().enumerate().any(|(j, t)| j != i && t.file().is_some_and(|g| g.path.name() == f.path.name()));
+        let f = self.list[i].file().filter(|f| !f.is_untitled())?;
+        let dup = self.list.iter().enumerate().any(|(j, t)| j != i && t.file().is_some_and(|g| !g.is_untitled() && g.path.name() == f.path.name()));
         if !dup {
             return None;
         }
@@ -229,7 +320,8 @@ impl Tabs {
                     let name_w = ui.painter().layout_no_wrap(title.clone(), t.font_ui(), t.ui.text).size().x.min(220.0);
                     let suf_w = suffix.as_ref().map_or(0.0, |s| ui.painter().layout_no_wrap(s.clone(), t.font_small(), t.ui.text).size().x.min(120.0) + 6.0);
                     let w = (12.0 + name_w + suf_w + 8.0 + 16.0 + 8.0).round();
-                    let (r, resp) = ui.allocate_exact_size(vec2(w, rect.height()), Sense::click());
+                    let (r, _) = ui.allocate_exact_size(vec2(w, rect.height()), Sense::hover());
+                    let resp = ui.interact(r, tab_id(self.list[i].id), Sense::click());
                     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
                     if active && reveal {
                         ui.scroll_to_rect(r, None);
@@ -261,7 +353,9 @@ impl Tabs {
                     } else if dirty {
                         widgets::dot(painter, c, 3.5, if active { t.ui.text } else { t.ui.text_muted });
                     }
-                    if close.clicked() || resp.middle_clicked() {
+                    if resp.secondary_clicked() {
+                        act = Some(StripAction::Menu(i, resp.interact_pointer_pos().unwrap_or(r.center())));
+                    } else if close.clicked() || resp.middle_clicked() {
                         act = Some(StripAction::Close(i));
                     } else if resp.clicked() {
                         act = Some(StripAction::Activate(i));

@@ -1,12 +1,13 @@
-//! The window: sidebar (files, search), tabs, editor, palette, settings, status bar.
+//! The window: menu bar, sidebar (search box + files), tabs (files, untitled, search, settings), editor | Markdown preview,
+//! bottom panel (results, call paths), palette, context menus, status bar.
 //!
 //! PUBLIC API IS FROZEN: `RunOpts`, `run`. Added: `App` (`App::new`, `App::ui`, `App::probe` for tests).
 //!
 //! | Module | What |
 //! |---|---|
-//! | `app` / `ops` | state + frame / commands, replies, file ops, overlays |
+//! | `app` / `ops` / `features` | state + frame / commands, replies, file ops, overlays / untitled + hot exit, Save As, replace, context menus, preview wiring |
 //! | `workspace` | engine client, requests in flight, index status |
-//! | `tree`, `tabs`, `search_panel`, `results_panel`, `palette`, `picker` | the parts |
+//! | `side`, `tree`, `tabs`, `search_panel`, `results_panel`, `paths_view`, `md_preview`, `menubar`, `palette`, `picker` | the parts |
 //! | `commands` | command registry + keymap |
 //! | `settings` / `settings_pane` / `state` | model + file format / Settings tab / `state.conf` + writer thread |
 //! | `hints` | outline thread + hint lines |
@@ -21,20 +22,23 @@ use std::path::PathBuf;
 
 use margin_proto::Opener;
 
-use margin_md as _;
-
 mod app;
 pub mod commands;
+mod features;
 pub mod fuzzy;
 pub mod hints;
+pub mod md_preview;
+pub mod menubar;
 mod ops;
 pub mod palette;
+pub mod paths_view;
 pub mod picker;
 mod probe;
 pub mod results_panel;
 pub mod sanitize;
 pub mod search_panel;
 pub mod settings;
+pub mod side;
 mod settings_pane;
 pub mod state;
 pub mod status;
@@ -45,7 +49,9 @@ mod welcome;
 pub mod widgets;
 pub mod workspace;
 
-pub use app::App;
+pub use app::{preview_divider_id, preview_toggle_id, App};
+pub use features::ctx_menu_id;
+pub use ops::save_as_id;
 pub use probe::Probe;
 
 pub struct RunOpts {

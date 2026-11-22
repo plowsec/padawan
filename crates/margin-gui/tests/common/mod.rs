@@ -60,13 +60,25 @@ impl H {
         for (name, text) in conf {
             cfg.write(name, text);
         }
+        Self::start(fake, cfg, folder, size, ppp, false)
+    }
+
+    fn start(fake: Fake, cfg: TempDir, folder: Option<&str>, size: [f32; 2], ppp: f32, fresh: bool) -> H {
         let shot = Shot::new(size, ppp);
         margin_theme::fonts::install(shot.ctx());
-        let opts = RunOpts { opener: Box::new(FakeOpener::new(fake.clone())), folder: folder.map(PathBuf::from), file: None, config_dir: Some(cfg.path().to_path_buf()), gui_sandbox: "seatbelt".into(), fresh: false };
+        let opts = RunOpts { opener: Box::new(FakeOpener::new(fake.clone())), folder: folder.map(PathBuf::from), file: None, config_dir: Some(cfg.path().to_path_buf()), gui_sandbox: "seatbelt".into(), fresh };
         let app = App::new(shot.ctx(), opts);
         let mut h = H { shot, app, fake, cfg };
         h.frames(2);
         h
+    }
+
+    /// Quit this app (`on_exit`) and start another on the same config dir and fake folder.
+    pub fn restart(mut self, folder: Option<&str>, fresh: bool) -> H {
+        self.app.on_exit();
+        self.app.flush_config();
+        let H { fake, cfg, .. } = self;
+        Self::start(fake, cfg, folder, [1280.0, 820.0], 1.0, fresh)
     }
 
     pub fn frames(&mut self, n: usize) {

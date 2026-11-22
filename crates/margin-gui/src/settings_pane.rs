@@ -127,6 +127,8 @@ pub fn show(ui: &mut Ui, rect: Rect, s: &mut Settings, t: &Theme, mac: bool) -> 
             s.mode = if i == 1 { Mode::Light } else { Mode::Dark };
             ch = true;
         }
+        let c = rows.row(ui, "Show menu bar", "", 40.0);
+        ch |= switch(ui, c, &mut s.menu_bar, t, id.with("menubar"));
         let c = rows.row(ui, "Accent", "", 5.0 * 26.0);
         for (i, a) in Accent::ALL.into_iter().enumerate() {
             let center = pos2(c.left() + 13.0 + 26.0 * i as f32, c.center().y);
@@ -178,9 +180,11 @@ pub fn show(ui: &mut Ui, rect: Rect, s: &mut Settings, t: &Theme, mac: bool) -> 
             ("Line numbers", "", &mut s.line_numbers, "ln"),
             ("Highlight current line", "", &mut s.highlight_line, "hl"),
             ("Show whitespace", "", &mut s.show_whitespace, "ws"),
+            ("Auto-indent", "Enter keeps the indentation; Markdown lists continue", &mut s.auto_indent, "autoindent"),
             ("Code hints", "Callers, callees and sinks above each function", &mut s.code_hints, "hints"),
             ("Save when the window loses focus", "", &mut s.autosave, "autosave"),
             ("Reopen tabs with the folder", "", &mut s.restore_tabs, "restore"),
+            ("Open preview with Markdown files", "Editor and preview side by side", &mut s.md_preview, "mdpreview"),
         ] {
             let c = rows.row(ui, label, desc, 40.0);
             ch |= switch(ui, c, v, t, id.with(k));

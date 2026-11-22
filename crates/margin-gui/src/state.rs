@@ -8,7 +8,8 @@
 //! | `tab = <rel path>` / `active = <rel path>` | open tabs of that folder, in order |
 //!
 //! Paths with control characters are never written (they would break the line format).
-//! Writes: temp file + rename, on the writer thread; only `settings.conf`, `state.conf` (+ `.tmp`) in an absolute config dir.
+//! Writes: temp file + rename, on the writer thread; only `settings.conf`, `state.conf` (+ `.tmp`) in an absolute config dir,
+//! and hot-exit buffers `untitled/untitled-<n>.txt` (+ `.tmp`). The only delete: one `untitled-<n>.txt` by name.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -20,6 +21,11 @@ pub const MAX_RECENT: usize = 12;
 const MAX_FOLDERS: usize = 32;
 const MAX_TABS: usize = 64;
 pub const SIDEBAR_W: std::ops::RangeInclusive<f32> = 160.0..=640.0;
+/// Hot-exit buffers kept on disk at most.
+pub const MAX_UNTITLED: usize = 32;
+/// Bytes of one hot-exit buffer at most.
+pub const MAX_UNTITLED_BYTES: usize = 4 << 20;
+const UNTITLED_DIR: &str = "untitled";
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct FolderTabs {
@@ -140,7 +146,20 @@ impl SavedState {
 
 enum Job {
     Write(&'static str, String),
+    WriteUntitled(u32, String),
+    RemoveUntitled(u32),
     Flush(Sender<()>),
+}
+
+/// File name of hot-exit buffer `n`.
+pub fn untitled_name(n: u32) -> String {
+    format!("untitled-{n}.txt")
+}
+
+/// `untitled-<n>.txt` → n.
+pub fn untitled_number(name: &str) -> Option<u32> {
+    let d = name.strip_prefix("untitled-")?.strip_suffix(".txt")?;
+    (!d.is_empty() && d.len() <= 9 && d.bytes().all(|b| b.is_ascii_digit())).then(|| d.parse().ok()).flatten()
 }
 
 /// Writes config files off the UI thread. `None` dir (or a relative/empty one): writes nothing.
@@ -189,6 +208,46 @@ impl Persist {
         self.send(Job::Write("state.conf", text));
     }
 
+    /// Write hot-exit buffer `n` (caller checks `MAX_UNTITLED_BYTES`).
+    pub fn save_untitled(&self, n: u32, text: String) {
+        self.send(Job::WriteUntitled(n, text));
+    }
+
+    /// Unlink hot-exit buffer `n` (if there).
+    pub fn remove_untitled(&self, n: u32) {
+        self.send(Job::RemoveUntitled(n));
+    }
+
+    /// Numbers of the hot-exit buffers on disk, sorted (start-up only).
+    pub fn untitled_numbers(&self) -> Vec<u32> {
+        let Some(d) = &self.dir else { return Vec::new() };
+        let mut v: Vec<u32> = std::fs::read_dir(d.join(UNTITLED_DIR))
+            .map(|it| it.filter_map(Result::ok).take(10_000).filter_map(|e| e.file_name().to_str().and_then(untitled_number)).collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    }
+
+    /// Hot-exit buffers on disk: `(n, text, was valid UTF-8)`, first `MAX_UNTITLED` by number, each read capped
+    /// (start-up only, before the first frame).
+    pub fn load_untitled(&self) -> Vec<(u32, String, bool)> {
+        let Some(d) = &self.dir else { return Vec::new() };
+        use std::io::Read;
+        let mut out = Vec::new();
+        for n in self.untitled_numbers().into_iter().take(MAX_UNTITLED) {
+            let mut buf = Vec::new();
+            if let Ok(f) = std::fs::File::open(d.join(UNTITLED_DIR).join(untitled_name(n))) {
+                let _ = f.take(MAX_UNTITLED_BYTES as u64).read_to_end(&mut buf);
+            }
+            let (text, ok) = match String::from_utf8(buf) {
+                Ok(s) => (s, true),
+                Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
+            };
+            out.push((n, text, ok));
+        }
+        out
+    }
+
     fn send(&self, j: Job) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(j);
@@ -214,6 +273,28 @@ fn writer(dir: PathBuf, rx: Receiver<Job>) {
                 let dst = dir.join(name);
                 if std::fs::write(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, &dst).is_err() {
                     let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            Job::WriteUntitled(n, text) => {
+                let ud = dir.join(UNTITLED_DIR);
+                if !ud.is_dir() {
+                    let _ = std::fs::create_dir(&ud);
+                }
+                let name = untitled_name(n);
+                let tmp = ud.join(format!("{name}.tmp"));
+                let dst = ud.join(&name);
+                if std::fs::write(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, &dst).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            Job::RemoveUntitled(n) => {
+                let ud = dir.join(UNTITLED_DIR);
+                let name = untitled_name(n);
+                let f = ud.join(&name);
+                // Exactly that file: absolute, directly inside `<config>/untitled`, the expected name.
+                let ok = f.is_absolute() && f.parent() == Some(ud.as_path()) && f.file_name().and_then(|x| x.to_str()).and_then(untitled_number) == Some(n);
+                if ok && f.is_file() {
+                    let _ = std::fs::remove_file(&f);
                 }
             }
             Job::Flush(done) => {
@@ -271,5 +352,30 @@ mod tests {
         assert!(Persist::new(Some(Path::new("rel"))).dir().is_none());
         assert!(Persist::new(Some(Path::new(""))).dir().is_none());
         Persist::new(None).flush(Duration::from_millis(1));
+    }
+
+    #[test]
+    fn untitled_buffers_round_trip_and_unlink() {
+        let t = margin_testutil::TempDir::new("gui-untitled");
+        let p = Persist::new(Some(t.path()));
+        p.save_untitled(3, "three".into());
+        p.save_untitled(1, "one".into());
+        p.flush(Duration::from_secs(5));
+        t.write("untitled/notes.txt", "not ours");
+        t.write("untitled/untitled-7.txt", "seven");
+        std::fs::write(t.path().join("untitled/untitled-9.txt"), b"ok\xff\xfe").unwrap();
+        let got = p.load_untitled();
+        assert_eq!(got.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 3, 7, 9]);
+        assert_eq!(got[0].1, "one");
+        assert!(!got[3].2, "lossy");
+        p.remove_untitled(3);
+        p.remove_untitled(42);
+        p.flush(Duration::from_secs(5));
+        assert!(!t.path().join("untitled/untitled-3.txt").exists());
+        assert!(t.path().join("untitled/notes.txt").exists(), "foreign files stay");
+        assert_eq!(untitled_number("untitled-12.txt"), Some(12));
+        for bad in ["untitled-.txt", "untitled-1.txt.tmp", "untitled--1.txt", "untitled-1234567890.txt", "x-1.txt"] {
+            assert_eq!(untitled_number(bad), None, "{bad}");
+        }
     }
 }

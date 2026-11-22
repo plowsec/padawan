@@ -218,23 +218,30 @@ fn settings_change_font_and_write_conf() {
 fn search_streams_sorted_hits_and_opens_one() {
     let mut h = H::new(&sample_files());
     h.opened();
+    // cmd+shift+F: sidebar field in Content mode; Enter opens a search tab.
     h.key(Key::F, cmd_shift());
-    assert!(h.probe().side_search);
+    assert_eq!(h.probe().side_mode, "content");
     h.type_text("parse_header");
+    h.key(Key::Enter, Modifiers::NONE);
     let p = h.until("hits", |p| p.search_hits == 3);
     assert_eq!(p.search_files, 1);
+    assert_eq!(p.active.as_deref(), Some("Search: parse_header"));
+    let tab = p.search_tab.unwrap();
     // Row 0 = file header, row 1 = first hit (line 3).
     h.frames(1);
-    let r = h.rect_of(Id::unique("search-results").with(1usize)).expect("hit row");
+    let r = h.rect_of(margin_gui::search_panel::results_id(tab).with(1usize)).expect("hit row");
     h.click(r.center());
     let p = h.until("opened at hit", |p| p.active.as_deref() == Some("main.c") && p.cursor.is_some_and(|c| c.0 == 2));
     assert_eq!(p.active_view, "text");
-    // Bad regex: error inline.
+    // Bad regex: error inline in the new tab.
     h.key(Key::F, cmd_shift());
     h.type_text("(");
-    let t = h.rect_of(Id::unique(("search-toggle", ".*"))).expect("regex toggle");
+    let t = h.rect_of(margin_gui::side::side_toggle_id(".*")).expect("regex toggle");
     h.click(t.center());
-    h.until("regex error", |p| p.search_error.is_some());
+    let f = h.rect_of(margin_gui::side::field_id()).unwrap();
+    h.click(f.center());
+    h.key(Key::Enter, Modifiers::NONE);
+    h.until("regex error", |p| p.search_error.is_some() && p.search_tabs == 2);
 }
 
 #[test]
@@ -256,12 +263,14 @@ fn hints_appear_and_callers_open_results() {
     // Esc closes it (results panel has focus).
     h.key(Key::Escape, Modifiers::NONE);
     assert!(h.probe().results_title.is_none());
-    // Sinks segment: local call sites.
+    // Sinks segment: call paths to sinks (bottom paths view).
     let segs_n = segs.iter().position(|s| s.starts_with("sinks")).unwrap();
     let r = h.rect_of(id.with(("lens", line, segs_n))).expect("sinks segment");
     h.click(r.center());
-    let p = h.until("sinks panel", |p| p.results == 1);
-    assert!(p.results_title.unwrap().starts_with("Sinks in parse_header"));
+    let p = h.until("paths panel", |p| p.paths_title.as_deref().is_some_and(|t| !t.ends_with('…')));
+    assert_eq!(p.paths_title.as_deref(), Some("Paths from parse_header to sinks · 0"));
+    assert!(p.results_title.is_none());
+    assert!(h.fake.requests().iter().any(|r| matches!(r, Request::Paths { name, sink, limit: 200 } if name == "parse_header" && sink.is_empty())));
 }
 
 #[test]
@@ -393,6 +402,7 @@ fn frame_time_100k_search_hits() {
     h.opened();
     h.key(Key::F, cmd_shift());
     h.type_text("needle");
+    h.key(Key::Enter, Modifiers::NONE);
     let t0 = std::time::Instant::now();
     h.until("100k hits", |p| p.search_hits == 100_000);
     let arrive = t0.elapsed();

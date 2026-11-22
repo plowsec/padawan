@@ -14,6 +14,7 @@
 //! | `soft_tabs`, `line_numbers`, `highlight_line`, `show_whitespace`, `code_hints`, `restore_tabs` | bool | on, on, on, off, on, on |
 //! | `wrap` | `auto` `on` `off` | auto |
 //! | `autosave` | bool (on focus loss) | off |
+//! | `auto_indent`, `menu_bar`, `md_preview` | bool (preview opens with Markdown files) | on, on, off |
 //! | `respect_gitignore`, `index_hidden` | bool | on, on |
 //! | `max_file_kb` | 16–65536 | 2048 |
 
@@ -42,6 +43,9 @@ pub struct Settings {
     pub respect_gitignore: bool,
     pub index_hidden: bool,
     pub max_file_kb: u32,
+    pub auto_indent: bool,
+    pub menu_bar: bool,
+    pub md_preview: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +66,9 @@ impl Default for Settings {
             respect_gitignore: true,
             index_hidden: true,
             max_file_kb: 2048,
+            auto_indent: true,
+            menu_bar: true,
+            md_preview: false,
         }
     }
 }
@@ -142,6 +149,9 @@ impl Settings {
                         "restore_tabs" => s.restore_tabs = b.unwrap_or(d.restore_tabs),
                         "respect_gitignore" => s.respect_gitignore = b.unwrap_or(d.respect_gitignore),
                         "index_hidden" => s.index_hidden = b.unwrap_or(d.index_hidden),
+                        "auto_indent" => s.auto_indent = b.unwrap_or(d.auto_indent),
+                        "menu_bar" => s.menu_bar = b.unwrap_or(d.menu_bar),
+                        "md_preview" => s.md_preview = b.unwrap_or(d.md_preview),
                         _ => {}
                     }
                 }
@@ -159,7 +169,8 @@ impl Settings {
              theme = {mode}\naccent = {}\nui_size = {}\ncode_size = {}\nline_height = {}\nzoom = {}\n\
              tab_width = {}\nsoft_tabs = {}\nwrap = {}\nline_numbers = {}\nhighlight_line = {}\n\
              show_whitespace = {}\ncode_hints = {}\nautosave = {}\nrestore_tabs = {}\n\
-             respect_gitignore = {}\nindex_hidden = {}\nmax_file_kb = {}\n",
+             respect_gitignore = {}\nindex_hidden = {}\nmax_file_kb = {}\n\
+             auto_indent = {}\nmenu_bar = {}\nmd_preview = {}\n",
             l.accent.name(),
             l.ui_size,
             l.code_size,
@@ -177,6 +188,9 @@ impl Settings {
             self.respect_gitignore,
             self.index_hidden,
             self.max_file_kb,
+            self.auto_indent,
+            self.menu_bar,
+            self.md_preview,
         )
     }
 
@@ -202,6 +216,9 @@ mod tests {
         s.autosave = true;
         s.respect_gitignore = false;
         s.max_file_kb = 512;
+        s.auto_indent = false;
+        s.menu_bar = false;
+        s.md_preview = true;
         assert_eq!(Settings::parse(&s.write()), s);
         assert_eq!(s.index_opts().max_file_bytes, 512 << 10);
     }
