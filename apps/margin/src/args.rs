@@ -10,6 +10,10 @@ pub enum Role {
     Launcher,
     Gui,
     Worker,
+    /// `--check-sandbox`: the launcher runs probes under both profiles.
+    Check,
+    /// Child of `--check-sandbox`: tries what the sandbox must refuse.
+    Probe,
     Help,
     Version,
 }
@@ -26,8 +30,11 @@ pub struct Args {
     pub file: Option<String>,
     /// Gui: config dir. Worker: cache dir.
     pub dir: Option<PathBuf>,
-    /// Gui: name of the sandbox it runs in, for the status bar.
+    /// Gui: name of the sandbox it runs in, for the status bar. Probe: which profile it is under (`gui` / `worker`).
     pub sandbox: String,
+    /// Probe: a directory it must NOT be able to touch, and a local TCP port it must not reach.
+    pub outside: Option<PathBuf>,
+    pub port: u16,
     /// Worker: index options.
     pub opts: IndexOpts,
 }
@@ -42,6 +49,8 @@ impl Args {
             file: None,
             dir: None,
             sandbox: "none".into(),
+            outside: None,
+            port: 0,
             opts: IndexOpts::default(),
         };
         let mut it = it.peekable();
@@ -61,10 +70,12 @@ impl Args {
                 "--help" => a.role = Role::Help,
                 "--version" => a.role = Role::Version,
                 "--no-sandbox" => a.no_sandbox = true,
+                "--check-sandbox" => a.role = Role::Check,
                 "--role" => {
                     a.role = match value("--role")?.to_string_lossy().as_ref() {
                         "gui" => Role::Gui,
                         "worker" => Role::Worker,
+                        "probe" => Role::Probe,
                         other => return Err(format!("unknown role {other:?}")),
                     }
                 }
@@ -72,6 +83,8 @@ impl Args {
                 "--file" => a.file = Some(value("--file")?.to_string_lossy().into_owned()),
                 "--config" | "--cache" => a.dir = Some(PathBuf::from(value(&s)?)),
                 "--sandbox" => a.sandbox = value("--sandbox")?.to_string_lossy().into_owned(),
+                "--outside" => a.outside = Some(PathBuf::from(value("--outside")?)),
+                "--port" => a.port = value("--port")?.to_string_lossy().parse().map_err(|_| "--port needs a number".to_owned())?,
                 "--gitignore" => a.opts.respect_gitignore = flag(&value("--gitignore")?)?,
                 "--hidden" => a.opts.index_hidden = flag(&value("--hidden")?)?,
                 "--max-file" => {

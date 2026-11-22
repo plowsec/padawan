@@ -9,6 +9,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "margin"
+path = "src/lib.rs"
+
 [[bin]]
 name = "margin"
 path = "src/main.rs"
