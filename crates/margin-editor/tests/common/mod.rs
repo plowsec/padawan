@@ -7,6 +7,7 @@ use margin_editor::{show, Document, EditorOptions, EditorOutput, EditorState, Le
 use margin_shot::Shot;
 use margin_theme::Theme;
 
+/// Screenshot output directory (absolute, inside `target/`).
 pub const SHOTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/agent-editor/shots");
 
 pub struct H {
