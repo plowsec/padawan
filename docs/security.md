@@ -12,7 +12,7 @@ launcher (no sandbox, reads no file content)
 
 | Process | Network | Exec / fork | Reads | Writes |
 |---|---|---|---|---|
-| launcher | not used | starts the two others | directory names (folder picker) | creates config + cache dirs |
+| launcher | not used | starts the two others; another launcher for "New Window" (rate-limited) | directory names (folder picker) | creates config + cache dirs |
 | gui | denied | denied | system files, own binary, `~/.config/margin` | `~/.config/margin`, per-user temp (Metal shader cache) |
 | worker | denied | denied | system libraries, own binary, the folder, its cache dir | the folder, its cache dir |
 
@@ -41,10 +41,12 @@ Why: the worker can write in the folder; a write there would mean code execution
 |---|---|
 | Run anything from the folder | no tasks, hooks, extensions, language servers, build scripts |
 | Read settings from the folder | config lives in `~/.config/margin` only; `.gitignore` is the one file interpreted, as glob patterns |
-| Open a URL, start a program | the GUI has no code path for it and the sandbox denies it |
+| Open a URL, start a program | the GUI has no code path for it and the sandbox denies it. Markdown links: files of the folder open, URLs are copied |
+| Load an image or interpret HTML | the Markdown preview draws a placeholder for images and shows HTML as text |
 | Follow a symlink out of the folder | `margin-engine` jail: canonical path must stay inside; directory symlinks are not traversed |
 | Open a FIFO, socket or device | `O_NOFOLLOW \| O_NONBLOCK`, then the open handle must be a regular file |
 | Recursive delete | files, symlinks and empty directories only |
+| Replace through a symlink or outside the folder | each file is read with `O_NOFOLLOW` and rewritten through the jail (atomic, checked against its mtime) |
 | Parse hostile bytes with C code | no tree-sitter, no libgit2, no webview. Lexers and outlines are safe Rust (`margin-code`) |
 | `unsafe` in this workspace | `unsafe_code = "forbid"` |
 | Trust a peer process | every message is bounds-checked on decode (`margin-proto::wire`); a bad frame ends the link |
@@ -65,6 +67,8 @@ Why: the worker can write in the folder; a write there would mean code execution
 |---|---|
 | Launcher is not sandboxed | it parses only frames from the GUI and its own arguments |
 | Check-then-open race in the jail | no `openat` without `unsafe`; the worker sandbox is the backstop |
-| GUI compromise + launcher | a subverted GUI could ask for a worker on any folder the policy above allows |
+| GUI compromise + launcher | a subverted GUI could ask for a worker on any folder the policy above allows, and for new windows (at most one per 400 ms) |
+| Clipboard | the GUI can read and write it (copy/paste); a subverted GUI could too |
+| Untitled notes | stored as plain text in `~/.config/margin/untitled/` |
 | Renderer | text shaping (egui) and Metal (wgpu) run in the GUI process on hostile text |
 | Call graph | by name, from token heuristics: hints are leads, not proofs |

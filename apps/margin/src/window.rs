@@ -25,6 +25,10 @@ pub fn spawn(folder: Option<&Path>, no_sandbox: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find my own binary: {e}"))?;
     let mut cmd = Command::new(exe);
     cmd.arg("--fresh");
+    // A smoke run must not chain: the new window only checks itself.
+    if std::env::var_os("MARGIN_SMOKE").is_some() {
+        cmd.env("MARGIN_SMOKE", "1");
+    }
     if no_sandbox {
         cmd.arg("--no-sandbox");
     }

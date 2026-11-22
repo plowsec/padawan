@@ -19,6 +19,7 @@ Worker process (the one that reads hostile files) links: `regex`, `memchr`, `ray
 
 | Not used | Instead |
 |---|---|
+| pulldown-cmark, comrak, a webview | `margin-md`: Markdown parser and egui preview |
 | tree-sitter + grammars (C) | `margin-code`: lexers and outlines in safe Rust |
 | ignore / globset / walkdir | `margin-engine`: walker, gitignore globs |
 | nucleo / fuzzy-matcher | `margin-engine::fuzzy` |

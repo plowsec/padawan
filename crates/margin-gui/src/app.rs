@@ -104,6 +104,15 @@ pub struct Smoke {
     pub frames_after: u32,
     pub verdict: Arc<Mutex<Option<Result<String, String>>>>,
     pub done: bool,
+    /// `MARGIN_SMOKE=clipboard`: copy a token, ask for a paste, expect it back. Overwrites the clipboard.
+    pub clip: Option<Clip>,
+}
+
+/// Clipboard round trip of the smoke run.
+pub struct Clip {
+    pub token: String,
+    pub frames: u32,
+    pub ok: bool,
 }
 
 pub struct App {
@@ -263,7 +272,8 @@ impl App {
     }
 
     pub(crate) fn enable_smoke(&mut self, verdict: Arc<Mutex<Option<Result<String, String>>>>) {
-        self.smoke = Some(Smoke { start: std::time::Instant::now(), frames_after: 0, verdict, done: false });
+        let clip = std::env::var("MARGIN_SMOKE").is_ok_and(|v| v == "clipboard").then(|| Clip { token: format!("margin-smoke-{}", std::process::id()), frames: 0, ok: false });
+        self.smoke = Some(Smoke { start: std::time::Instant::now(), frames_after: 0, verdict, done: false, clip });
     }
 
     /// Wait for queued config writes (tests).
@@ -832,15 +842,36 @@ impl App {
             if ready && file_ok {
                 s.frames_after += 1;
             }
-            (s.frames_after > 3).then(|| {
+            // Clipboard: copy on the first ready frame, ask for a paste a few frames later, wait for it (60 frames).
+            let mut clip_note = String::new();
+            let mut clip_wait = false;
+            if let Some(c) = s.clip.as_mut().filter(|_| ready && file_ok) {
+                c.frames += 1;
+                if c.frames == 1 {
+                    ctx.copy_text(c.token.clone());
+                } else if c.frames == 6 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                }
+                if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if *t == c.token))) {
+                    c.ok = true;
+                }
+                clip_wait = !c.ok && c.frames < 60;
+                clip_note = format!(" clipboard={}", if c.ok { "ok" } else { "FAILED" });
+            }
+            (s.frames_after > 3 && !clip_wait).then(|| {
                 let ws = self.ws.as_ref();
                 let name = ws.map(Workspace::display_name).unwrap_or_default();
                 let files = ws.and_then(|w| w.index).map_or(0, |i| i.files_total);
                 let tab = self.tabs.active_file().map_or("-".to_owned(), |f| clean(f.path.as_str()));
-                Ok(format!("smoke: ok root={name} files={files} tab={tab} sandbox={}/{}", self.gui_sandbox, self.opener.sandbox()))
+                Ok(format!("smoke: ok root={name} files={files} tab={tab} sandbox={}/{}{clip_note}", self.gui_sandbox, self.opener.sandbox()))
             })
         };
         if let Some(v) = verdict {
+            // `MARGIN_SMOKE=newwindow`: also ask for a second window on the same folder (it runs a plain smoke check).
+            if v.is_ok() && std::env::var("MARGIN_SMOKE").is_ok_and(|e| e == "newwindow") {
+                let root = self.ws.as_ref().map(|w| std::path::PathBuf::from(w.root_str()));
+                self.opener.new_window(root.as_deref());
+            }
             s.done = true;
             if let Ok(mut g) = s.verdict.lock() {
                 *g = Some(v);

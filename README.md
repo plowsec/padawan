@@ -22,27 +22,59 @@ margin --no-sandbox /abs/folder           # one process, no OS sandbox (debuggin
 
 ## Keys
 
-`cmd` = Cmd on macOS, Ctrl elsewhere.
+`cmd` = Cmd on macOS, Ctrl elsewhere. Every action is in the palette and the menu bar, with its shortcut.
 
 | Key | Does |
 |---|---|
 | `ctrl+p` / `cmd+p` | palette: actions and files. `>` actions only, `:42` go to line, `@` functions of the file |
 | `cmd+t` | go to file |
-| `cmd+o` | open folder |
-| `cmd+shift+f` | search in folder (text or regex, globs) |
+| `cmd+o`, `cmd+shift+n` | open folder, new window |
+| `cmd+n` | new untitled tab (no file until you save) |
+| `cmd+s`, `cmd+shift+s`, `cmd+alt+s` | save, save as, save all |
+| `cmd+w` | close tab |
+| `cmd+shift+e` | sidebar search: file names |
+| `cmd+shift+f`, `cmd+shift+h` | search in folder, replace in folder (opens a search tab) |
 | `cmd+f`, `cmd+alt+f` | find, replace in file |
 | `cmd+g` / `f3`, with `shift` | find next, previous (`f3` only off macOS) |
-| `cmd+s`, `cmd+w`, `cmd+n` | save, close tab, new file |
-| `f12` / cmd+click | go to definition |
-| `shift+f12` | callers of the word under the cursor |
+| `f12` / cmd+click, `shift+f12` | go to definition, callers |
 | `ctrl+g`, `cmd+shift+o` | go to line, go to function in file |
 | `ctrl+-`, `ctrl+shift+-` | back, forward (`alt+←` / `alt+→` off macOS) |
 | `ctrl+tab`, `ctrl+shift+tab` | next, previous tab |
-| `cmd+b` | sidebar |
-| `cmd+,` | settings (theme, accent, font sizes, line height, wrap, hints, index) |
+| `alt+↑` / `alt+↓`, `shift+alt+↓`, `cmd+shift+k` | move line, duplicate line, delete line |
+| `cmd+]`, `cmd+[`, `cmd+/` | indent, outdent, toggle comment |
+| `cmd+shift+v` | Markdown preview |
+| `cmd+b`, `alt+z` | sidebar, word wrap |
+| `cmd+,` | settings |
 | `cmd+=` `cmd+-` `cmd+0` | zoom |
 
-Every action is in the palette, with its shortcut.
+Right-click: editor, file tree, tabs, search results.
+
+## Search
+
+One box at the top of the sidebar.
+
+| Mode | Typing | Result |
+|---|---|---|
+| Names | `todo`, `*.md`, `src/**/*.c` | fuzzy or glob on file names; the tree becomes the list of matches |
+| Content | text, or a regex with `.*` on | Enter opens a `Search: …` tab; several can be open |
+
+| Filter | Example | Rule |
+|---|---|---|
+| include | `*.rs, src/**` | a file must match one |
+| exclude | `target/**, *.min.js` | a file must match none |
+| `!` in include | `*.c, !tests/**` | same as an exclude |
+
+Replace (search tab): `Replace All` or per file. Regex: `$1`, `${name}`. Files are rewritten on disk after a confirmation; not undoable. Tabs with unsaved edits are skipped.
+
+## Notes and Markdown
+
+| What | How |
+|---|---|
+| Quick note | `cmd+n`. Kept in `~/.config/margin/untitled/` until saved or discarded; restored at start |
+| Save it | `cmd+s` asks for a path in the open folder |
+| Preview | `cmd+shift+v`: editor left, rendered right, live |
+| Links in the preview | `#heading` and files of the folder open; URLs are copied, never opened |
+| Images, HTML | never loaded, never interpreted |
 
 ## Hints above functions
 
@@ -52,10 +84,18 @@ Every action is in the palette, with its shortcut.
 |---|---|---|
 | callers | call sites of that name in the folder | list them |
 | callees | distinct functions it calls | list the calls |
-| sinks | dangerous calls made directly (exec, memory, eval, deserialize, sql, file, format, network, html) | list them |
-| reaches | sinks reachable through calls | list them with the call chain |
+| sinks | dangerous calls made directly (exec, memory, eval, deserialize, sql, file, format, network, html) | call paths |
+| reaches | sinks reachable through calls | call paths |
 
-By name, from token heuristics: leads for a reader, not proofs. Languages: C, C++, Rust, Go, Java, JavaScript, TypeScript, Python, C#, PHP, Ruby, Kotlin, Swift, Lua, Shell.
+Call paths: one group per sink call, one row per call on the way, and under each call `argument ← inputs`.
+
+| Shown | Means |
+|---|---|
+| `n ← len` | parameter `len` of the enclosing function reaches argument `n`, directly or through local assignments |
+| `input reaches sink` | a parameter of the first function is tracked into a sink argument through every call |
+| `no tracked input` | nothing was tracked; not a proof of safety |
+
+By name, from token heuristics: leads for a reader, not proofs. Not tracked: return values, globals, fields read back, branches. Languages: C, C++, Rust, Go, Java, JavaScript, TypeScript, Python, C#, PHP, Ruby, Kotlin, Swift, Lua, Shell.
 
 ## Layout
 
@@ -66,7 +106,8 @@ By name, from token heuristics: leads for a reader, not proofs. Languages: C, C+
 | `crates/margin-engine` | everything that touches the folder: jail, walk, index, search, call graph, cache |
 | `crates/margin-code` | lexers, outlines, sink tables. Safe Rust, no dependency |
 | `crates/margin-editor` | the editor widget |
-| `crates/margin-gui` | window: tree, tabs, palette, search, settings, status bar |
+| `crates/margin-md` | Markdown parser and preview. Safe Rust, written here |
+| `crates/margin-gui` | window: sidebar, tabs, menus, palette, search tabs, call paths, settings |
 | `crates/margin-theme` | palettes, fonts, egui style |
 | `crates/margin-shot`, `margin-testutil` | headless render to PNG; `TempDir` for tests |
 | `docs/security.md` | threat model, sandbox, known limits |
@@ -77,6 +118,7 @@ By name, from token heuristics: leads for a reader, not proofs. Languages: C, C+
 | What | Where |
 |---|---|
 | Settings, recent folders | `~/.config/margin/settings.conf`, `state.conf` |
+| Unsaved untitled tabs | `~/.config/margin/untitled/` |
 | Index cache (per folder) | `~/Library/Caches/margin/roots/<hash>/` (Linux: `~/.cache/margin`) |
 
 Nothing is written into an opened folder except the files you save.
@@ -88,6 +130,8 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
 cargo run -p margin-gui --example app_shot -- /abs/out/dir     # screenshots of the main states
 MARGIN_SMOKE=1 target/debug/margin /abs/folder                 # start, index, print `smoke: ok …`, exit
+MARGIN_SMOKE=clipboard target/debug/margin /abs/folder         # same + copy/paste round trip (overwrites the clipboard)
+MARGIN_SMOKE=newwindow target/debug/margin /abs/folder         # same + a second window
 ```
 
 | Rule | Detail |

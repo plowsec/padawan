@@ -58,6 +58,7 @@ fn worker_serves_a_folder_from_inside_the_sandbox() {
     let root = TempDir::new("root");
     root.write("notes/todo.md", "# Todo\n\nbuy needle_in_haystack\n");
     root.write("src/main.c", "int main(void) {\n    return run(1);\n}\n");
+    root.write("src/copy.c", "void copy(char *dst, const char *src, unsigned n) {\n    memcpy(dst, src, n);\n}\n\nvoid handle(char *out, const char *body, unsigned len) {\n    copy(out, body, len);\n}\n");
     std::os::unix::fs::symlink(&secret, root.path().join("leak.txt")).unwrap();
     std::os::unix::fs::symlink(outside.path(), root.path().join("leakdir")).unwrap();
     let cache = TempDir::new("cache");
@@ -145,6 +146,45 @@ fn worker_serves_a_folder_from_inside_the_sandbox() {
     }
     assert_eq!(hits.len(), 1);
     assert_eq!((hits[0].path.as_str(), hits[0].line), ("notes/todo.md", 2));
+
+    // File names by glob, with an exclude.
+    let id = client.request(Request::FindFiles { query: "*.c".into(), include: String::new(), exclude: "src/main.c".into(), limit: 10 });
+    match reply(&client, id) {
+        Reply::FileMatches { items, .. } => assert_eq!(items.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(), ["src/copy.c"]),
+        other => panic!("{other:?}"),
+    }
+
+    // Call path with argument flow: handle → copy → memcpy.
+    let id = client.request(Request::Paths { name: "handle".into(), sink: String::new(), limit: 10 });
+    match reply(&client, id) {
+        Reply::Paths { paths, .. } => {
+            assert_eq!(paths.len(), 1, "{paths:?}");
+            let path = &paths[0];
+            assert_eq!((path.sink.as_str(), path.hops.len(), path.flows), ("memcpy", 2, true), "{path:?}");
+            assert_eq!(path.hops[0].site.context, "handle");
+            assert!(path.hops[1].args.iter().any(|a| !a.from.is_empty()), "{path:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Replace rewrites inside the folder, and never through the symlink to the outside.
+    let q = |pattern: &str| SearchQuery { pattern: pattern.into(), max_hits: 100, ..Default::default() };
+    let id = client.request(Request::Replace { query: q("zebra_crossing"), replacement: "giraffe".into(), only: vec![], skip: vec![] });
+    match reply(&client, id) {
+        Reply::Replaced { files, replacements, changed, .. } => {
+            assert_eq!((files, replacements), (1, 1));
+            assert_eq!(changed, [p("notes/todo.md")]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(root.path().join("notes/todo.md")).unwrap(), "# Todo\n\nfind giraffe\n");
+    let id = client.request(Request::Replace { query: q("top secret"), replacement: "pwned".into(), only: vec![p("leak.txt")], skip: vec![] });
+    match reply(&client, id) {
+        Reply::Replaced { files, .. } => assert_eq!(files, 0),
+        Reply::Err { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "top secret");
 
     // Closing the pipe ends the worker.
     drop(client);
