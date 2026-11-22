@@ -20,3 +20,4 @@ margin-gui.workspace = true
 
 [dev-dependencies]
 margin-testutil.workspace = true
+eframe.workspace = true

@@ -82,12 +82,30 @@ impl Outbox {
     }
 }
 
-/// Opens a folder: starts an engine for it and returns the GUI end. Must not block
-/// (failures arrive as `Event::Fatal`). The previous engine of this opener is stopped.
+/// One level of the folder picker: the sub-directories of `path`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirListing {
+    /// Absolute, canonical.
+    pub path: String,
+    /// `None` at the filesystem root.
+    pub parent: Option<String>,
+    /// Directory names, sorted, capped.
+    pub dirs: Vec<String>,
+    /// Why the listing failed; empty on success.
+    pub error: String,
+}
+
+/// What the GUI needs from outside its sandbox: engines for folders, and directory names for the folder picker.
+/// Nothing here may block the UI thread.
 pub trait Opener: Send {
+    /// Start an engine on `root` and return the GUI end. Failures arrive as `Event::Fatal`.
+    /// The previous engine of this opener is stopped.
     fn open(&mut self, root: &Path, opts: &IndexOpts, waker: Waker) -> Client;
     /// What confines the engine, for the status bar: `"seatbelt"`, `"none"`…
     fn sandbox(&self) -> &str;
+    /// Ask for the sub-directories of `path` (`None`: the home directory). The answer comes through `poll_browse`.
+    fn browse(&mut self, path: Option<&Path>, waker: Waker);
+    fn poll_browse(&mut self) -> Option<DirListing>;
 }
 
 /// Both ends in one process.

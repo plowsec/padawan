@@ -18,7 +18,7 @@ pub mod mux;
 pub mod path;
 pub mod wire;
 
-pub use link::{Client, Opener, Outbox, Waker};
+pub use link::{Client, DirListing, Opener, Outbox, Waker};
 pub use msg::*;
 pub use path::RelPath;
 

@@ -369,7 +369,7 @@ impl Theme {
 
     /// Install into `ctx` (both egui theme slots). Cheap when nothing changed: call every frame.
     pub fn apply(&self, ctx: &egui::Context) {
-        let id = egui::Id::new("margin-theme");
+        let id = egui::Id::unique("margin-theme");
         if ctx.data(|d| d.get_temp::<Theme>(id)) == Some(*self) {
             return;
         }

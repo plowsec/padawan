@@ -2,7 +2,8 @@
 //! for a worker on a folder, then engine frames are relayed both ways, tagged with the worker generation
 //! (frames of a replaced worker are dropped).
 
-use crate::limits::{MAX_FRAME, MAX_PATH, MAX_TEXT};
+use crate::limits::{MAX_DIR_ENTRIES, MAX_FRAME, MAX_NAME, MAX_PATH, MAX_TEXT};
+use crate::link::DirListing;
 use crate::msg::{IndexOpts, Wire};
 use crate::wire::{Dec, Enc, WireError, WireResult};
 
@@ -17,6 +18,8 @@ pub enum ToLauncher {
     Engine { gen: u32, payload: Vec<u8> },
     /// Stop everything.
     Quit,
+    /// Folder picker: list the sub-directories of `path` (empty: the home directory).
+    Browse { path: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +28,8 @@ pub enum FromLauncher {
     Engine { gen: u32, payload: Vec<u8> },
     /// The worker of `gen` could not start, or ended. `msg` is for the user.
     Ended { gen: u32, msg: String },
+    /// Answer to `Browse`.
+    Dirs(DirListing),
 }
 
 impl ToLauncher {
@@ -43,6 +48,10 @@ impl ToLauncher {
                 e.bytes(payload);
             }
             ToLauncher::Quit => e.u8(3),
+            ToLauncher::Browse { path } => {
+                e.u8(4);
+                e.str(path);
+            }
         }
         e.finish()
     }
@@ -53,6 +62,7 @@ impl ToLauncher {
             1 => ToLauncher::Spawn { gen: d.u32()?, root: d.string(MAX_PATH)?, opts: IndexOpts::dec(&mut d)? },
             2 => ToLauncher::Engine { gen: d.u32()?, payload: d.bytes(MAX_FRAME)?.to_vec() },
             3 => ToLauncher::Quit,
+            4 => ToLauncher::Browse { path: d.string(MAX_PATH)? },
             t => return Err(WireError::BadTag(t)),
         };
         d.finish()?;
@@ -74,6 +84,13 @@ impl FromLauncher {
                 e.u32(*gen);
                 e.str(msg);
             }
+            FromLauncher::Dirs(l) => {
+                e.u8(3);
+                e.str(&l.path);
+                e.opt(l.parent.as_ref(), |e, p| e.str(p));
+                e.seq(&l.dirs, |e, n| e.str(n));
+                e.str(&l.error);
+            }
         }
         e.finish()
     }
@@ -83,6 +100,12 @@ impl FromLauncher {
         let v = match d.u8()? {
             1 => FromLauncher::Engine { gen: d.u32()?, payload: d.bytes(MAX_FRAME)?.to_vec() },
             2 => FromLauncher::Ended { gen: d.u32()?, msg: d.string(MAX_TEXT)? },
+            3 => FromLauncher::Dirs(DirListing {
+                path: d.string(MAX_PATH)?,
+                parent: d.opt(|d| d.string(MAX_PATH))?,
+                dirs: d.seq(MAX_DIR_ENTRIES, 4, |d| d.string(MAX_NAME))?,
+                error: d.string(MAX_TEXT)?,
+            }),
             t => return Err(WireError::BadTag(t)),
         };
         d.finish()?;
@@ -100,10 +123,12 @@ mod tests {
             ToLauncher::Spawn { gen: 2, root: "/tmp/x".into(), opts: IndexOpts::default() },
             ToLauncher::Engine { gen: 2, payload: vec![1, 2, 3] },
             ToLauncher::Quit,
+            ToLauncher::Browse { path: "/tmp".into() },
         ] {
             assert_eq!(ToLauncher::decode(&m.encode()).unwrap(), m);
         }
-        for m in [FromLauncher::Engine { gen: 1, payload: vec![] }, FromLauncher::Ended { gen: 1, msg: "x".into() }] {
+        let dirs = DirListing { path: "/a".into(), parent: Some("/".into()), dirs: vec!["b".into(), "c d".into()], error: String::new() };
+        for m in [FromLauncher::Engine { gen: 1, payload: vec![] }, FromLauncher::Ended { gen: 1, msg: "x".into() }, FromLauncher::Dirs(dirs)] {
             assert_eq!(FromLauncher::decode(&m.encode()).unwrap(), m);
         }
         assert!(ToLauncher::decode(&[9]).is_err());
