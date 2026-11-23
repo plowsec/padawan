@@ -1,0 +1,147 @@
+# Build every platform. On a `v*` tag: publish a GitHub release with the archives.
+# Release: bump `version` in Cargo.toml, commit, `git tag vX.Y.Z`, `git push origin main vX.Y.Z`.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+
+permissions:
+  contents: read
+
+env:
+  RUST: "1.100.0"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64, os: macos-15, target: aarch64-apple-darwin, smoke: true }
+          - { name: macos-x86_64, os: macos-15, target: x86_64-apple-darwin, smoke: false }
+          - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, smoke: true }
+          - { name: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, smoke: true }
+          - { name: windows-x86_64, os: windows-2022, target: x86_64-pc-windows-msvc, smoke: true }
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      NAME: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: toolchain
+        run: |
+          rustup toolchain install "$RUST" --profile minimal --target "$TARGET" --no-self-update
+          rustup default "$RUST"
+
+      - name: build
+        run: |
+          set -o pipefail
+          cargo build --release --locked --target "$TARGET" -p margin 2>&1 | tee build.log
+
+      # Job logs need a login; annotations do not.
+      - name: build errors
+        if: failure()
+        run: |
+          [ -f build.log ] || exit 0
+          msg=$(grep -vE '^ +(Compiling|Downloaded|Downloading) ' build.log | tail -n 60 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=build $NAME::$msg"
+
+      - name: package
+        run: |
+          set -eu
+          ver=${GITHUB_REF_NAME//\//-}
+          dir="margin-$ver-$NAME"
+          exe=margin
+          [ "$RUNNER_OS" = Windows ] && exe=margin.exe
+          py=$(command -v python3 || command -v python)
+          mkdir "$dir"
+          cp "target/$TARGET/release/$exe" LICENSE README.md "$dir/"
+          "$py" scripts/third-party.py "$TARGET" > "$dir/THIRD-PARTY.txt"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -bd "$dir.zip" "$dir" > /dev/null
+            echo "ARCHIVE=$dir.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$dir.tar.gz" "$dir"
+            echo "ARCHIVE=$dir.tar.gz" >> "$GITHUB_ENV"
+          fi
+          echo "BIN=$PWD/$dir/$exe" >> "$GITHUB_ENV"
+
+      # Does the built binary start, open a folder, index it and draw? Result goes to an annotation.
+      - name: smoke (does not block)
+        if: matrix.smoke
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          run=
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -q > /dev/null
+            sudo apt-get install -y -q --no-install-recommends xvfb mesa-vulkan-drivers libgl1-mesa-dri libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2 > /dev/null
+            run="xvfb-run -a"
+          fi
+          code=0
+          MARGIN_SMOKE=1 $run "$BIN" "$PWD/crates/margin-md" > smoke.log 2>&1 || code=$?
+          cat smoke.log
+          msg=$(tail -n 12 smoke.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          if [ "$code" = 0 ]; then echo "::notice title=smoke $NAME::$msg"; else echo "::warning title=smoke $NAME failed ($code)::$msg"; fi
+          exit "$code"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd dist
+          ls -l
+          sha256sum margin-* > SHA256SUMS
+          cat > ../notes.md <<'EOF'
+          Unsigned builds. Check the download against `SHA256SUMS`.
+
+          | Platform | File | State |
+          |---|---|---|
+          | macOS, Apple silicon | `macos-arm64.tar.gz` | tested; sandbox on |
+          | macOS, Intel | `macos-x86_64.tar.gz` | built, not run; sandbox on |
+          | Linux x86_64 / arm64, glibc 2.35+ | `linux-*.tar.gz` | starts in CI only; no OS sandbox |
+          | Windows 10+ x86_64 | `windows-x86_64.zip` | starts in CI only; no OS sandbox |
+
+          ```bash
+          tar -xzf margin-*-macos-arm64.tar.gz && cd margin-*-macos-arm64
+          xattr -d com.apple.quarantine margin      # macOS: the build is not notarized
+          ./margin /abs/folder
+          ```
+
+          Linux needs X11 or Wayland, `libxkbcommon`, and a Vulkan or OpenGL driver.
+          EOF
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Margin $GITHUB_REF_NAME" --notes-file ../notes.md margin-* SHA256SUMS

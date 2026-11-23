@@ -1,14 +1,15 @@
 //! Where things live. All outside any opened folder.
 //!
-//! | What | macOS | Other unix |
-//! |---|---|---|
-//! | config (`settings.conf`, `state.conf`) | `~/.config/margin` | `$XDG_CONFIG_HOME/margin`, `~/.config/margin` |
-//! | cache (index per folder) | `~/Library/Caches/margin` | `$XDG_CACHE_HOME/margin`, `~/.cache/margin` |
+//! | What | macOS | Other unix | Windows |
+//! |---|---|---|---|
+//! | home | `$HOME` | `$HOME` | `%USERPROFILE%` |
+//! | config (`settings.conf`, `state.conf`) | `~/.config/margin` | `$XDG_CONFIG_HOME/margin`, `~/.config/margin` | `%APPDATA%\margin` |
+//! | cache (index per folder) | `~/Library/Caches/margin` | `$XDG_CACHE_HOME/margin`, `~/.cache/margin` | `%LOCALAPPDATA%\margin` |
 
 use std::path::{Path, PathBuf};
 
 pub fn home() -> Option<PathBuf> {
-    abs_env("HOME")
+    abs_env(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
 }
 
 fn abs_env(name: &str) -> Option<PathBuf> {
@@ -17,12 +18,18 @@ fn abs_env(name: &str) -> Option<PathBuf> {
 }
 
 pub fn config_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return Some(abs_env("APPDATA")?.join("margin"));
+    }
     abs_env("XDG_CONFIG_HOME").or_else(|| Some(home()?.join(".config"))).map(|p| p.join("margin"))
 }
 
 pub fn cache_dir() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         return Some(home()?.join("Library/Caches/margin"));
+    }
+    if cfg!(windows) {
+        return Some(abs_env("LOCALAPPDATA")?.join("margin"));
     }
     abs_env("XDG_CACHE_HOME").or_else(|| Some(home()?.join(".cache"))).map(|p| p.join("margin"))
 }

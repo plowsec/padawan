@@ -153,7 +153,7 @@ pub fn check_root(path: &Path, home: Option<&Path>, own_dirs: &[&Path]) -> Resul
         if home.starts_with(&root) {
             return Err(format!("refusing to open {}: it is or contains your home directory. Open a sub-folder.", root.display()));
         }
-        for sensitive in ["Library", ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config", ".local", ".cargo", ".rustup", ".claude"] {
+        for sensitive in ["Library", "AppData", ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config", ".local", ".cargo", ".rustup", ".claude"] {
             let s = home.join(sensitive);
             if root.starts_with(&s) || s.starts_with(&root) {
                 return Err(format!("refusing to open {}: it holds credentials or start-up items (~/{sensitive})", root.display()));
