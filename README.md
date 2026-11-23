@@ -4,6 +4,8 @@ Small, fast editor for notes, files and reading code. Rust, native GUI (egui/wgp
 
 ## Run
 
+Builds (unsigned): [releases](https://github.com/plowsec/padawan/releases). Check against `SHA256SUMS`. macOS: `xattr -d com.apple.quarantine margin` after unpacking.
+
 ```bash
 cargo build --release --locked            # binary: target/release/margin
 margin                                    # welcome screen
@@ -17,8 +19,11 @@ margin --no-sandbox /abs/folder           # one process, no OS sandbox (debuggin
 
 | Platform | State |
 |---|---|
-| macOS | built and tested; both sandboxes on (`margin --check-sandbox`) |
-| Linux, Windows | not built or tested yet; no OS sandbox (in-process checks only) |
+| macOS arm64 | built and tested; both sandboxes on (`margin --check-sandbox`) |
+| macOS x86_64 | built in CI, never run |
+| Linux x86_64 / arm64, Windows x86_64 | built in CI; CI starts it, opens a folder, indexes, draws (`MARGIN_SMOKE=1`). Not used by hand. No OS sandbox (in-process checks only) |
+
+Linux needs X11 or Wayland, `libxkbcommon`, a Vulkan or OpenGL driver, glibc 2.35+.
 
 ## Keys
 
@@ -120,6 +125,7 @@ By name, from token heuristics: leads for a reader, not proofs. Not tracked: ret
 | Settings, recent folders | `~/.config/margin/settings.conf`, `state.conf` |
 | Unsaved untitled tabs | `~/.config/margin/untitled/` |
 | Index cache (per folder) | `~/Library/Caches/margin/roots/<hash>/` (Linux: `~/.cache/margin`) |
+| Windows | `%APPDATA%\margin` (settings, untitled), `%LOCALAPPDATA%\margin` (cache) |
 
 Nothing is written into an opened folder except the files you save.
 
@@ -133,6 +139,8 @@ scripts/sign.sh                                                # macOS: codesign
 MARGIN_SMOKE=1 target/debug/margin /abs/folder                 # start, index, print `smoke: ok …`, exit
 MARGIN_SMOKE=clipboard target/debug/margin /abs/folder         # same + copy/paste round trip (overwrites the clipboard)
 MARGIN_SMOKE=newwindow target/debug/margin /abs/folder         # same + a second window
+git tag vX.Y.Z && git push origin main vX.Y.Z                  # release: CI builds all platforms and publishes (.github/workflows/build.yml)
+scripts/third-party.py <target-triple>                         # crates in the binary + licence texts (shipped as THIRD-PARTY.txt)
 ```
 
 | Rule | Detail |
