@@ -259,6 +259,22 @@ fn no_repaint_when_idle() {
 }
 
 #[test]
+fn empty_preedit_during_scroll_does_not_snap_back() {
+    // Linux IMEs send Preedit("") when the IME cursor area moves (e.g. on scroll).
+    let text: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+    let mut h = H::new(&text, Lang::Plain);
+    h.frame();
+    assert_eq!(h.st.top_line(), 0);
+    h.shot.move_to([300.0, 300.0]);
+    for _ in 0..20 {
+        h.shot.scroll([0.0, -40.0]);
+        h.ev(Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }));
+    }
+    h.frames(20);
+    assert!(h.st.top_line() > 10, "scroll snapped back: top {}", h.st.top_line());
+}
+
+#[test]
 fn ime_preedit_and_commit() {
     let mut h = H::new("ab", Lang::Plain);
     h.st.goto(0, 1);

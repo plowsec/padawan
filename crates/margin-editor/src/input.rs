@@ -391,8 +391,13 @@ pub fn keys(ui: &mut egui::Ui, cx: &mut Cx<'_, '_>) {
             Event::Ime(ime) => {
                 match ime {
                     ImeEvent::Preedit { text, .. } => {
-                        cx.v.preedit = (!text.is_empty()).then(|| text.clone());
-                        cx.v.reveal = cx.v.reveal.max_near();
+                        // Linux IMEs send an empty Preedit whenever the IME cursor area
+                        // moves (e.g. on scroll); revealing then snaps the view back.
+                        let new = (!text.is_empty()).then(|| text.clone());
+                        if new.is_some() && new != cx.v.preedit {
+                            cx.v.reveal = cx.v.reveal.max_near();
+                        }
+                        cx.v.preedit = new;
                     }
                     ImeEvent::Commit(t) => {
                         cx.v.preedit = None;
