@@ -616,6 +616,81 @@ fn md_preview_toggle_links_and_tasks() {
 }
 
 #[test]
+fn md_preview_select_copy_and_menu() {
+    let files = vec![("a.md", "# Top\n\nFirst paragraph.\n\nSecond with [web](https://example.com/x).\n")];
+    let mut h = H::new(&files);
+    h.opened();
+    open_file(&mut h, "a.md");
+    click_id(&mut h, margin_gui::preview_toggle_id());
+    let p = h.until("drawn", |p| p.preview_parsed && p.preview_text.len() == 3);
+    let (first, second) = (p.preview_text[1], p.preview_text[2]);
+    let secondary = |h: &mut H, at: egui::Pos2| {
+        h.shot.move_to([at.x, at.y]);
+        h.frames(1);
+        for pressed in [true, false] {
+            h.shot.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: NONE });
+            h.frames(1);
+        }
+    };
+    // Nothing selected: Copy is greyed.
+    secondary(&mut h, first.center());
+    assert_eq!(h.probe().ctx_menu, vec!["(Copy)", "Select All"]);
+    h.key(Key::Escape, NONE);
+
+    // Drag over the first paragraph, cmd+C.
+    h.shot.press_at([first.left() + 0.5, first.center().y], NONE);
+    h.frames(1);
+    h.shot.move_to([first.right() + 20.0, first.center().y]);
+    h.frames(2);
+    h.shot.release();
+    h.frames(2);
+    assert_eq!(h.probe().preview_selection, "First paragraph.");
+    h.shot.event(egui::Event::Copy);
+    h.frames(2);
+    assert_eq!(h.shot.copied.last().map(String::as_str), Some("First paragraph."));
+    assert!(h.probe().edit_log.is_empty(), "the editor was not asked");
+
+    // Edit ▸ Select All, then Edit ▸ Copy: the preview, because it was used last.
+    let item = |c| margin_gui::commands::MENUS[1].1.iter().position(|x| *x == margin_gui::commands::MenuItem::Cmd(c)).unwrap();
+    click_id(&mut h, menubar::title_id(1));
+    click_id(&mut h, menubar::popup_id(1).with(item(margin_gui::commands::Cmd::SelectAll)));
+    assert_eq!(h.probe().preview_selection, "Top\n\nFirst paragraph.\n\nSecond with web.");
+    click_id(&mut h, menubar::title_id(1));
+    click_id(&mut h, menubar::popup_id(1).with(item(margin_gui::commands::Cmd::Copy)));
+    assert_eq!(h.shot.copied.last().map(String::as_str), Some("Top\n\nFirst paragraph.\n\nSecond with web."));
+    assert!(h.probe().edit_log.is_empty());
+    assert_eq!(h.probe().active_text.as_deref(), Some(files[0].1), "source untouched");
+
+    // Context menu on the link: Copy, Copy Link, Select All.
+    // (egui keeps Esc for a focused widget from its second focused frame on.)
+    h.frames(2);
+    h.key(Key::Escape, NONE);
+    assert_eq!(h.probe().preview_selection, "", "Esc clears the selection");
+    h.shot.press_at([second.left() + 0.5, second.center().y], NONE);
+    h.frames(1);
+    h.shot.move_to([second.left() + 40.0, second.center().y]);
+    h.frames(2);
+    h.shot.release();
+    h.frames(2);
+    let part = h.probe().preview_selection;
+    assert!(!part.is_empty() && "Second with web.".starts_with(&part), "{part:?}");
+    secondary(&mut h, egui::pos2(second.right() - 12.0, second.center().y));
+    assert_eq!(h.probe().ctx_menu, vec!["Copy", "Copy Link", "Select All"]);
+    ctx_pick(&mut h, "Copy Link");
+    assert_eq!(h.shot.copied.last().map(String::as_str), Some("https://example.com/x"));
+    secondary(&mut h, first.center());
+    ctx_pick(&mut h, "Copy");
+    assert_eq!(h.shot.copied.last(), Some(&part));
+
+    // Back in the editor: Select All is the editor's again.
+    let ed = h.probe().editor_id.and_then(|id| h.rect_of(id)).expect("editor");
+    h.click(egui::pos2(ed.left() + 120.0, ed.top() + 40.0));
+    click_id(&mut h, menubar::title_id(1));
+    click_id(&mut h, menubar::popup_id(1).with(item(margin_gui::commands::Cmd::SelectAll)));
+    assert_eq!(h.probe().edit_log, vec![EditAction::SelectAll]);
+}
+
+#[test]
 fn md_preview_setting_opens_it_and_untitled_previews() {
     let files = vec![("n.md", "# N\n")];
     let mut h = H::build(&files, Script::default(), Some(common::ROOT), [1280.0, 820.0], 1.0, &[("settings.conf", "md_preview = true\n")]);

@@ -79,6 +79,7 @@ Replace (search tab): `Replace All` or per file. Regex: `$1`, `${name}`. Files a
 | Save it | `cmd+s` asks for a path in the open folder |
 | Preview | `cmd+shift+v`: editor left, rendered right, live |
 | Links in the preview | `#heading` and files of the folder open; URLs are copied, never opened |
+| Copy from the preview | drag to select (double click: word, triple: block, shift+click: extend), `cmd+a`, `cmd+c`, right-click menu. Lists keep their markers, table cells are tab-separated |
 | Images, HTML | never loaded, never interpreted |
 
 ## Hints above functions

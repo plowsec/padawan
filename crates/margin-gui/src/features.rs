@@ -40,6 +40,9 @@ pub enum CtxAct {
     CloseTab(u64),
     CloseOthers(u64),
     CloseAll,
+    /// Copy the selection of the Markdown preview of tab.
+    MdCopy(u64),
+    MdSelectAll(u64),
 }
 
 pub struct CtxMenu {
@@ -441,6 +444,37 @@ impl App {
         self.open_ctx(pos, items);
     }
 
+    /// Right-click on the Markdown preview of `tab`; `link`: the destination under the pointer.
+    pub(crate) fn open_md_menu(&mut self, tab: u64, pos: Pos2, link: Option<String>) {
+        let has_sel = self.tabs.file_by_id(tab).and_then(|f| f.preview.as_ref()).is_some_and(|p| p.doc.as_ref().is_some_and(|d| p.state.has_selection(d)));
+        let key = |c: crate::commands::Cmd| crate::commands::shortcut(c, self.mac);
+        let mut items = vec![(MenuEntry::item("Copy", key(crate::commands::Cmd::Copy), has_sel), Some(CtxAct::MdCopy(tab)))];
+        if let Some(l) = link {
+            items.push(item("Copy Link", CtxAct::Copy(l)));
+        }
+        items.push(sep());
+        items.push((MenuEntry::item("Select All", key(crate::commands::Cmd::SelectAll), true), Some(CtxAct::MdSelectAll(tab))));
+        self.open_ctx(pos, items);
+    }
+
+    /// Copy / Select All on the preview of `tab`. `false`: no preview there.
+    pub(crate) fn md_edit(&mut self, tab: u64, all: bool) -> bool {
+        let Some(pv) = self.tabs.file_by_id(tab).and_then(|f| f.preview.as_mut()) else { return false };
+        let Some(d) = pv.doc.clone() else { return false };
+        pv.active = true;
+        pv.state.request_focus();
+        if all {
+            pv.state.select_all(&d);
+        } else {
+            let s = pv.state.selected_text(&d);
+            if !s.is_empty() {
+                self.ctx.copy_text(s);
+            }
+        }
+        self.ctx.request_repaint();
+        true
+    }
+
     pub(crate) fn ctx_menu_ui(&mut self, ctx: &egui::Context) {
         let t = self.theme;
         let Some(m) = self.ctx_menu.as_mut() else { return };
@@ -502,6 +536,12 @@ impl App {
             CtxAct::CloseAll => {
                 let ids: Vec<u64> = self.tabs.list.iter().map(|t| t.id).collect();
                 self.close_many(ids);
+            }
+            CtxAct::MdCopy(tab) => {
+                self.md_edit(tab, false);
+            }
+            CtxAct::MdSelectAll(tab) => {
+                self.md_edit(tab, true);
             }
         }
     }

@@ -14,6 +14,7 @@
 //! | `build` | raw blocks → leaves (chunks, footnotes, gaps, hashes, slugs) |
 //! | `doc` | document types, debug dump |
 //! | `lay` | layout + paint of one leaf |
+//! | `sel` | text selection: positions, hit test, copied text |
 //! | `view` | scrolling, virtualization, input |
 //!
 //! PUBLIC API IS FROZEN (margin-gui compiles against it). Add items if needed; do not change these.
@@ -27,6 +28,7 @@ mod build;
 mod doc;
 mod inline;
 mod lay;
+mod sel;
 mod text;
 mod view;
 
@@ -107,6 +109,34 @@ impl PreviewState {
     pub fn hits(&self) -> &[(egui::Rect, Hit)] {
         &self.v.hits
     }
+
+    /// Text runs drawn in the last frame (screen rects, document order). Tests, automation.
+    pub fn text_rects(&self) -> Vec<egui::Rect> {
+        self.v.text_rects()
+    }
+
+    /// Is text of `doc` selected?
+    pub fn has_selection(&self, doc: &MdDoc) -> bool {
+        self.v.has_selection(&doc.inner)
+    }
+
+    /// The selection as text (what a copy puts on the clipboard); empty without one.
+    pub fn selected_text(&self, doc: &MdDoc) -> String {
+        self.v.selected_text(&doc.inner)
+    }
+
+    pub fn select_all(&mut self, doc: &MdDoc) {
+        self.v.select_all(&doc.inner);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.v.clear_selection();
+    }
+
+    /// Take keyboard focus on the next `show` (copy and scroll keys go to the preview).
+    pub fn request_focus(&mut self) {
+        self.v.focus_req = true;
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -117,6 +147,12 @@ pub struct PreviewOutput {
     pub task_toggled: Option<u32>,
     /// Source line (0-based) of the first visible block.
     pub top_line: u32,
+    /// The preview has keyboard focus.
+    pub focused: bool,
+    /// Secondary press on the preview: where (screen). The caller draws the menu.
+    pub context_menu: Option<egui::Pos2>,
+    /// The link under that press: destination as written (hostile text).
+    pub context_link: Option<String>,
 }
 
 /// Draw the preview in all the space `ui` has left.

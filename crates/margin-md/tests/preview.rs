@@ -296,3 +296,195 @@ fn frame_time_on_5mb() {
     let idle_bound = if cfg!(debug_assertions) { Duration::from_millis(100) } else { Duration::from_millis(4) };
     assert!(idle < idle_bound, "idle frame {}", ms(idle));
 }
+
+// ---- selection ----
+
+const SEL_DOC: &str = "# Title\n\nFirst paragraph here.\n\nSecond one with [a link](x.md).\n\n- item one\n- item two\n\n```\nlet x = 1;\nlet y = 2;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+
+impl H {
+    fn drag(&mut self, from: Pos2, to: Pos2) {
+        self.shot.press_at([from.x, from.y], Modifiers::NONE);
+        self.frame();
+        for k in 1..=4 {
+            let t = k as f32 / 4.0;
+            self.shot.move_to([from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t]);
+            self.frame();
+        }
+        self.shot.release();
+        self.frames(2);
+    }
+
+    fn copy(&mut self) -> Option<String> {
+        let n = self.shot.copied.len();
+        self.shot.event(egui::Event::Copy);
+        self.frames(2);
+        self.shot.copied.get(n..).and_then(|c| c.last().cloned())
+    }
+
+    fn sel(&self) -> String {
+        self.st.selected_text(&self.doc)
+    }
+}
+
+#[test]
+fn drag_selects_across_blocks_and_copies() {
+    let mut h = H::new(SEL_DOC, [800.0, 700.0], 1.0, Mode::Dark);
+    let r = h.st.text_rects();
+    assert!(r.len() >= 9, "title, 2 paragraphs, 2 items, code, 4 cells: {r:?}");
+    assert!(!h.st.has_selection(&h.doc));
+    assert_eq!(h.copy(), None, "nothing selected, no focus: nothing copied");
+
+    // Start of "First…" to the end of "Second…".
+    h.drag(r[1].left_center() + egui::vec2(0.5, 0.0), r[2].right_center() + egui::vec2(30.0, 0.0));
+    assert_eq!(h.sel(), "First paragraph here.\n\nSecond one with a link.");
+    assert!(h.out.focused, "a press in the preview focuses it");
+    assert_eq!(h.copy().as_deref(), Some("First paragraph here.\n\nSecond one with a link."));
+    assert!(h.outs.iter().all(|o| o.link_clicked.is_none()), "a drag ending on a link is not a click");
+
+    // Backwards drag gives the same text.
+    h.drag(r[2].right_center() + egui::vec2(30.0, 0.0), r[1].left_center() + egui::vec2(0.5, 0.0));
+    assert_eq!(h.sel(), "First paragraph here.\n\nSecond one with a link.");
+
+    // Down to the bottom of the page: everything from the title on.
+    h.drag(r[0].left_center() + egui::vec2(0.5, 0.0), Pos2::new(780.0, 690.0));
+    assert_eq!(h.sel(), "Title\n\nFirst paragraph here.\n\nSecond one with a link.\n\n- item one\n- item two\n\nlet x = 1;\nlet y = 2;\n\na\tb\n1\t2");
+
+    // A plain click drops the selection.
+    h.click(r[1].center());
+    assert!(!h.st.has_selection(&h.doc));
+    assert_eq!(h.sel(), "");
+}
+
+#[test]
+fn double_and_triple_click_shift_click_select_all() {
+    let mut h = H::new(SEL_DOC, [800.0, 700.0], 2.0, Mode::Light);
+    let r = h.st.text_rects();
+    let at = r[1].left_center() + egui::vec2(8.0, 0.0); // inside "First"
+    h.click(at);
+    h.click(at);
+    assert_eq!(h.sel(), "First");
+    h.click(at);
+    assert_eq!(h.sel(), "First paragraph here.");
+
+    // Shift+click extends from the anchor.
+    h.click(r[1].left_center() + egui::vec2(0.5, 0.0));
+    let to = r[3].right_center() + egui::vec2(20.0, 0.0);
+    h.shot.press_at([to.x, to.y], Modifiers::SHIFT);
+    h.frame();
+    h.shot.release();
+    h.frames(2);
+    assert_eq!(h.sel(), "First paragraph here.\n\nSecond one with a link.\n\n- item one");
+
+    // Select all, copy, Esc.
+    h.shot.key(egui::Key::A, Modifiers::COMMAND);
+    h.frames(2);
+    let all = h.sel();
+    assert!(all.starts_with("Title\n\nFirst") && all.ends_with("a\tb\n1\t2"), "{all:?}");
+    assert_eq!(h.copy().as_deref(), Some(all.as_str()));
+    h.shot.key(egui::Key::Escape, Modifiers::NONE);
+    h.frames(2);
+    assert!(!h.st.has_selection(&h.doc));
+}
+
+#[test]
+fn selection_in_code_and_table_cells() {
+    let mut h = H::new(SEL_DOC, [800.0, 700.0], 1.0, Mode::Dark);
+    let r = h.st.text_rects();
+    let code = r[5];
+    // Second code line only.
+    h.drag(Pos2::new(code.left() + 0.5, code.bottom() - 4.0), Pos2::new(code.right() + 40.0, code.bottom() - 4.0));
+    assert_eq!(h.sel(), "let y = 2;");
+    // Both lines.
+    h.drag(Pos2::new(code.left() + 0.5, code.top() + 4.0), Pos2::new(code.right() + 40.0, code.bottom() - 4.0));
+    assert_eq!(h.sel(), "let x = 1;\nlet y = 2;");
+    // Header cell "b" to body cell "1": row-major order.
+    h.drag(r[7].left_center() + egui::vec2(0.5, 0.0), r[8].right_center() + egui::vec2(3.0, 0.0));
+    assert_eq!(h.sel(), "b\n1");
+    // One cell by double click.
+    h.click(r[9].center());
+    h.click(r[9].center());
+    assert_eq!(h.sel(), "2");
+}
+
+#[test]
+fn selection_survives_scroll_and_dies_with_the_document() {
+    let mut text = String::new();
+    for i in 0..300 {
+        text.push_str(&format!("Paragraph number {i}.\n\n"));
+    }
+    let mut h = H::new(&text, [800.0, 600.0], 1.0, Mode::Dark);
+    let r = h.st.text_rects();
+    h.drag(r[0].left_center() + egui::vec2(0.5, 0.0), r[1].right_center() + egui::vec2(10.0, 0.0));
+    assert_eq!(h.sel(), "Paragraph number 0.\n\nParagraph number 1.");
+    // Scrolled far away: still selected (positions are in the document, not on screen).
+    for _ in 0..10 {
+        h.shot.move_to([400.0, 300.0]);
+        h.shot.scroll([0.0, -600.0]);
+        h.frame();
+    }
+    assert!(h.out.top_line > 20);
+    assert_eq!(h.sel(), "Paragraph number 0.\n\nParagraph number 1.");
+
+    // Dragging below the bottom edge scrolls and extends.
+    let top0 = h.out.top_line;
+    let r = h.st.text_rects();
+    h.shot.press_at([r[0].left() + 0.5, r[0].center().y], Modifiers::NONE);
+    h.frame();
+    h.shot.move_to([400.0, 640.0]);
+    h.frames(30);
+    h.shot.release();
+    h.frames(2);
+    assert!(h.out.top_line > top0 + 10, "auto-scroll: {} -> {}", top0, h.out.top_line);
+    assert!(h.sel().matches("Paragraph number").count() > 15, "{}", h.sel().len());
+
+    // Select all on a big document copies all of it, laid out or not.
+    h.shot.key(egui::Key::A, Modifiers::COMMAND);
+    h.frames(2);
+    let all = h.sel();
+    assert!(all.starts_with("Paragraph number 0.") && all.ends_with("Paragraph number 299."), "{}", all.len());
+
+    // New document: the selection is gone.
+    h.doc = parse("Other text.\n");
+    h.frames(2);
+    assert!(!h.st.has_selection(&h.doc));
+    assert_eq!(h.sel(), "");
+}
+
+#[test]
+fn context_press_reports_position_and_link() {
+    let mut h = H::new(SEL_DOC, [800.0, 700.0], 1.0, Mode::Dark);
+    let r = h.st.text_rects();
+    let link = h.hit(|x| matches!(x, Hit::Link(_))).expect("link");
+    let secondary = |h: &mut H, at: Pos2| {
+        h.outs.clear();
+        h.shot.move_to([at.x, at.y]);
+        h.frame();
+        h.shot.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+        h.frame();
+        h.shot.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+        h.frames(2);
+        h.outs.iter().find(|o| o.context_menu.is_some()).cloned()
+    };
+    // Select a paragraph, then right-click it: the selection stays.
+    h.click(r[1].center());
+    h.click(r[1].center());
+    h.click(r[1].center());
+    let o = secondary(&mut h, r[1].center()).expect("menu");
+    assert_eq!(o.context_menu, Some(r[1].center()));
+    assert_eq!(o.context_link, None);
+    assert_eq!(h.sel(), "First paragraph here.");
+    let o = secondary(&mut h, link.center()).expect("menu on the link");
+    assert_eq!(o.context_link.as_deref(), Some("x.md"));
+    assert!(h.outs.iter().all(|o| o.link_clicked.is_none()), "secondary press does not follow the link");
+}
+
+#[test]
+fn selection_screenshot() {
+    for (mode, name) in [(Mode::Dark, "dark"), (Mode::Light, "light")] {
+        let mut h = H::new(SEL_DOC, [800.0, 520.0], 2.0, mode);
+        let r = h.st.text_rects();
+        h.drag(r[1].left_center() + egui::vec2(60.0, 0.0), r[8].right_center() + egui::vec2(3.0, 0.0));
+        assert!(h.sel().contains("Second one with a link.\n\n- item one") && h.sel().ends_with("a\tb\n1"), "{:?}", h.sel());
+        h.png(&format!("selection-{name}.png"));
+    }
+}

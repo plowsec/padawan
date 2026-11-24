@@ -7,6 +7,8 @@
 //! | relative link | no scheme, not `/…`; `#frag` / `?query` stripped, `%20` decoded, resolved against the file's dir, `RelPath`-checked → open the file |
 //! | scheme or absolute | copied to the clipboard; never opened |
 //! | task box | `[ ]` ⇄ `[x]` on that source line, one undo step |
+//! | copy, select all | go to the preview while it is the pane used last (`active`), else to the editor |
+//! | secondary click | menu: Copy, Copy Link (on a link), Select All |
 
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -38,6 +40,8 @@ pub struct Preview {
     pub editor_top: Option<u32>,
     /// Narrow window: show the editor instead of the preview.
     pub show_editor: bool,
+    /// The preview had focus more recently than the editor: Copy and Select All act on it.
+    pub active: bool,
 }
 
 pub struct MdDone {

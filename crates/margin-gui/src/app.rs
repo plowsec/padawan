@@ -679,6 +679,13 @@ impl App {
             self.inject_md = injected;
         }
         self.md_ratio = ratio;
+        // Which pane Copy / Select All from the menus go to: the one focused last.
+        let (ed_focus, pv_focus) = (result.as_ref().is_some_and(|o| o.focused), md_out.as_ref().is_some_and(|o| o.focused));
+        if ed_focus || pv_focus {
+            if let Some(pv) = self.tabs.file_by_id(tab_id).and_then(|f| f.preview.as_mut()) {
+                pv.active = pv_focus;
+            }
+        }
         if let Some(out) = result {
             self.word_at_cursor = out.word_at_cursor;
             if let Some((word, _)) = out.goto_definition {
@@ -697,6 +704,9 @@ impl App {
             }
             if let Some(line) = o.task_toggled {
                 self.md_task(tab_id, line);
+            }
+            if let Some(pos) = o.context_menu {
+                self.open_md_menu(tab_id, pos, o.context_link);
             }
         }
         let panel = self.results.is_some() || self.paths.is_some();

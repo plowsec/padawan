@@ -7,17 +7,23 @@
 //! | cache | layout per leaf hash (survives re-parse), cleared on theme / width / scale change |
 //! | scrollbar | proportional to the estimated total; drag maps to a position via prefix sums |
 //! | input | wheel (vertical; horizontal over a wide table), link / checkbox clicks, scrollbar drag |
+//! | selection | press + drag (scrolls at the edges), shift+click extends, double click: word, triple: block |
+//! | keys (focused) | copy, select all, Esc clears; arrows, PageUp/Down, Space, Home, End scroll |
+//!
+//! Selection input uses the galleys painted last frame (what the pointer is on). It is dropped when the
+//! document changes. Focus is taken on a press inside; copy and keys only act with focus.
 //!
 //! Slot of a leaf = gap above + content height. Never opens anything: clicks are returned.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egui::{pos2, vec2, CursorIcon, Painter, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui::{pos2, vec2, CursorIcon, Event, Key, Painter, PointerButton, Rect, Sense, Stroke, StrokeKind, Vec2};
 use margin_theme::{mix, Theme};
 
 use crate::doc::{Body, CtrKind, Inner, Leaf, TextKind, NONE};
-use crate::lay::{self, Cols, HitRec, Laid, Lx, Sty, COL_MAX, PAD_X, SB_W};
+use crate::lay::{self, Cols, HitRec, Laid, Lx, Px, Sty, COL_MAX, PAD_X, SB_W};
+use crate::sel::{self, Area, P};
 use crate::PreviewOutput;
 
 /// What a clickable area does.
@@ -53,6 +59,13 @@ pub struct View {
     table_rects: Vec<(Rect, u32, f32)>,
     frame: u64,
     drag: Option<f32>,
+    /// Selection `(anchor, head)`; equal = none.
+    sel: Option<(P, P)>,
+    sel_doc: u64,
+    selecting: bool,
+    /// Galleys painted last frame.
+    areas: Vec<Area>,
+    pub focus_req: bool,
 }
 
 impl std::fmt::Debug for View {
@@ -130,6 +143,42 @@ fn estimate(sty: &Sty, leaf: &Leaf, w: f32) -> f32 {
 }
 
 impl View {
+    /// Selection in document order, if not empty.
+    fn ordered(&self) -> Option<(P, P)> {
+        let (a, b) = self.sel?;
+        match a.cmp(&b) {
+            std::cmp::Ordering::Less => Some((a, b)),
+            std::cmp::Ordering::Greater => Some((b, a)),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
+    pub fn has_selection(&self, doc: &Inner) -> bool {
+        self.sel_doc == doc.id && self.ordered().is_some()
+    }
+
+    pub fn selected_text(&self, doc: &Inner) -> String {
+        match self.ordered() {
+            Some((a, b)) if self.sel_doc == doc.id => sel::copy(doc, a, b),
+            _ => String::new(),
+        }
+    }
+
+    pub fn select_all(&mut self, doc: &Inner) {
+        self.sel = Some((P::default(), sel::end(doc)));
+        self.sel_doc = doc.id;
+        self.selecting = false;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.sel = None;
+        self.selecting = false;
+    }
+
+    pub fn text_rects(&self) -> Vec<Rect> {
+        self.areas.iter().map(|a| a.rect).collect()
+    }
+
     fn slot(&self, i: usize) -> f32 {
         self.gap.get(i).copied().unwrap_or(0.0) + self.h.get(i).copied().unwrap_or(0.0)
     }
@@ -400,6 +449,11 @@ pub fn show(ui: &mut egui::Ui, doc: &Inner, v: &mut View, theme: &Theme) -> Prev
     let rect = ui.available_rect_before_wrap();
     let id = ui.scope_id().with("margin-md-preview");
     let _ = ui.allocate_rect(rect, Sense::hover());
+    // Not the left edge: the caller's split handle overlaps it.
+    let text_rect = Rect::from_min_max(pos2(rect.left() + 4.0, rect.top()), pos2(rect.right() - SB_W, rect.bottom()));
+    let fid = id.with("text");
+    // Focusable background under the links: holds keyboard focus, takes drags.
+    let _ = ui.interact(text_rect, fid, Sense::click_and_drag());
     let ctx = ui.ctx().clone();
     let ppp = ctx.pixels_per_point();
     let painter = ui.painter_at(rect);
@@ -415,6 +469,125 @@ pub fn show(ui: &mut egui::Ui, doc: &Inner, v: &mut View, theme: &Theme) -> Prev
     if let Some(l) = v.pending.take() {
         if n > 0 {
             v.go_to_leaf(doc.leaf_at_line(l), n);
+        }
+    }
+
+    // Selection: pointer.
+    if v.sel_doc != doc.id {
+        v.sel = None;
+        v.selecting = false;
+        v.areas.clear();
+        v.sel_doc = doc.id;
+    }
+    if std::mem::take(&mut v.focus_req) {
+        ui.memory_mut(|m| m.request_focus(fid));
+    }
+    let (pressed, down, secondary, ptr, shift, dbl, tpl) = ui.input(|i| {
+        let p = &i.pointer;
+        // Modifiers of the press itself (they can change within a frame).
+        let shift = i.modifiers.shift || i.events.iter().any(|e| matches!(e, Event::PointerButton { button: PointerButton::Primary, pressed: true, modifiers, .. } if modifiers.shift));
+        (p.primary_pressed(), p.primary_down(), p.secondary_pressed(), p.interact_pos(), shift, p.button_double_clicked(PointerButton::Primary), p.button_triple_clicked(PointerButton::Primary))
+    });
+    let over = ptr.is_some_and(|p| text_rect.contains(p)) && ui.rect_contains_pointer(text_rect);
+    if over && (pressed || secondary) {
+        ui.memory_mut(|m| m.request_focus(fid));
+    }
+    if over && secondary {
+        out.context_menu = ptr;
+        out.context_link = ptr.and_then(|p| {
+            v.hits.iter().find_map(|(r, h)| match h {
+                Hit::Link(d) if r.contains(p) => Some(d.clone()),
+                _ => None,
+            })
+        });
+    }
+    if over && pressed {
+        if let Some(h) = ptr.and_then(|p| sel::hit(&v.areas, p)) {
+            v.sel = Some(match v.sel {
+                Some((a, _)) if shift => (a, h),
+                _ => (h, h),
+            });
+            v.selecting = true;
+        }
+    }
+    if v.selecting {
+        if let (true, Some(p)) = (down, ptr) {
+            if let (Some((a, _)), Some(h)) = (v.sel, sel::hit(&v.areas, p)) {
+                v.sel = Some((a, h));
+            }
+            // Past the top or bottom edge: scroll, faster with distance.
+            let dy = if p.y < rect.top() { p.y - rect.top() } else { (p.y - rect.bottom()).max(0.0) };
+            if dy != 0.0 {
+                v.scroll_by(&lx, (dy * 0.35).clamp(-60.0, 60.0));
+            }
+            ctx.request_repaint();
+        } else {
+            v.selecting = false;
+        }
+    }
+    if over && (dbl || tpl) {
+        if let Some(h) = ptr.and_then(|p| sel::hit(&v.areas, p)) {
+            if let Some(leaf) = doc.leaves.get(h.leaf as usize) {
+                let mut t = String::new();
+                sel::unit_text(doc, leaf, h.unit, &mut t);
+                let (s, e) = if tpl { (0, t.chars().count() as u32) } else { sel::word_at(&t, h.ch) };
+                v.sel = Some((P { ch: s, ..h }, P { ch: e, ..h }));
+            }
+        }
+    }
+    if over && ptr.is_some_and(|p| v.areas.iter().any(|a| a.rect.expand(2.0).contains(p))) {
+        ctx.set_cursor_icon(CursorIcon::Text);
+    }
+
+    // Selection and scrolling: keys.
+    let focused = ui.memory(|m| m.has_focus(fid));
+    if focused {
+        ui.memory_mut(|m| m.set_focus_lock_filter(fid, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true }));
+        let page = (rect.height() - 2.0 * sty.lh).max(sty.lh);
+        let (mut copy, mut all, mut esc, mut dy, mut edge) = (false, false, false, 0.0f32, 0i8);
+        ui.input(|i| {
+            for e in &i.events {
+                match e {
+                    Event::Copy | Event::Cut => copy = true,
+                    Event::Key { key, pressed: true, modifiers, .. } => match key {
+                        Key::A if modifiers.command => all = true,
+                        Key::Escape => esc = true,
+                        Key::ArrowDown => dy += 2.0 * sty.lh,
+                        Key::ArrowUp => dy -= 2.0 * sty.lh,
+                        Key::PageDown => dy += page,
+                        Key::PageUp => dy -= page,
+                        Key::Space if !modifiers.command => dy += if modifiers.shift { -page } else { page },
+                        Key::Home => edge = -1,
+                        Key::End => edge = 1,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        });
+        if all {
+            v.select_all(doc);
+        }
+        if esc {
+            v.clear_selection();
+        }
+        if copy {
+            let t = v.selected_text(doc);
+            if !t.is_empty() {
+                ctx.copy_text(t);
+            }
+        }
+        if dy != 0.0 {
+            v.scroll_by(&lx, dy);
+        }
+        match edge {
+            -1 => v.set_pos(0.0, n),
+            1 => {
+                v.rebuild_tops();
+                let end = v.tops.get(n.saturating_sub(1)).copied().unwrap_or(0.0) + f64::from(v.max_off_last(n));
+                v.set_pos(end, n);
+            }
+            _ => {}
         }
     }
 
@@ -475,6 +648,10 @@ pub fn show(ui: &mut egui::Ui, doc: &Inner, v: &mut View, theme: &Theme) -> Prev
 
     // Visible leaves.
     let mut recs: Vec<HitRec> = Vec::new();
+    let mut areas = std::mem::take(&mut v.areas);
+    areas.clear();
+    let sel_color = if focused { theme.code.selection } else { theme.code.selection_inactive };
+    let mut px = Px::new(&mut recs, &mut areas, v.ordered(), sel_color);
     v.table_rects.clear();
     let col_left = rect.left() + PAD_X;
     let mut y = rect.top() - v.off;
@@ -496,25 +673,25 @@ pub fn show(ui: &mut egui::Ui, doc: &Inner, v: &mut View, theme: &Theme) -> Prev
         doc.chain(leaf.ctr, &mut chain);
         let (ind, muted) = indent(&sty, doc, leaf.ctr);
         if ctop + h >= rect.top() - 2.0 {
-            paint_ctrs(&painter, &lx, i, &chain, &prev, col_left, y, ctop, ctop + h, laid.first(), &mut recs);
+            paint_ctrs(&painter, &lx, i, &chain, &prev, col_left, y, ctop, ctop + h, laid.first(), px.hits);
             let x = col_left + ind;
             let w = (col_w - ind).max(40.0);
             match (&*laid, &leaf.body) {
                 (Laid::Text { t, rule, .. }, Body::Text { kind, .. }) => {
                     let color = lay::text_style(&lx, *kind, muted).color;
-                    lay::paint_text(&painter, theme, t, pos2(x, ctop), clip, i as u32, &mut recs, color);
+                    lay::paint_text(&painter, theme, t, pos2(x, ctop), clip, i as u32, 0, &mut px, color);
                     if *rule {
                         painter.hline(x..=x + w, ((ctop + h - 1.0) * ppp).round() / ppp + 0.5 / ppp, Stroke::new(1.0, theme.ui.border));
                     }
                 }
-                (Laid::Code { .. }, body) => lay::paint_code(&painter, theme, &sty, &laid, body, x, ctop, w),
+                (Laid::Code { .. }, body) => lay::paint_code(&painter, theme, &sty, &laid, body, x, ctop, w, i as u32, &mut px),
                 (Laid::Table { cols, .. }, body @ Body::Table { tid, .. }) => {
                     let maxx = (cols.total - w).max(0.0);
                     let sx = v.table_x.get(tid).copied().unwrap_or(0.0).min(maxx);
                     if maxx > 0.0 {
                         v.table_rects.push((Rect::from_min_size(pos2(x, ctop), vec2(w, h)), *tid, maxx));
                     }
-                    lay::paint_table(&painter, &lx, &laid, body, x, ctop, w, sx, i as u32, &mut recs);
+                    lay::paint_table(&painter, &lx, &laid, body, x, ctop, w, sx, i as u32, &mut px);
                 }
                 (Laid::Rule { .. }, _) => {
                     painter.hline(x..=x + w, (ctop * ppp).round() / ppp + 0.5 / ppp, Stroke::new(1.0, theme.ui.border));
@@ -526,6 +703,8 @@ pub fn show(ui: &mut egui::Ui, doc: &Inner, v: &mut View, theme: &Theme) -> Prev
         i += 1;
         std::mem::swap(&mut chain, &mut prev);
     }
+    drop(px);
+    v.areas = areas;
 
     // Clicks, hover, tooltips.
     let mut hovered_link: Option<(u32, u32)> = None;
@@ -589,6 +768,7 @@ pub fn show(ui: &mut egui::Ui, doc: &Inner, v: &mut View, theme: &Theme) -> Prev
         painter.rect_filled(Rect::from_min_max(pos2(track.right() - 7.0, ty + 2.0), pos2(track.right() - 2.0, ty + th - 2.0)), 3.0, c);
     }
 
+    out.focused = ui.memory(|m| m.has_focus(fid));
     out.top_line = doc.leaves.get(v.top).map_or(0, |l| l.line);
     v.last_top_line = out.top_line;
     if v.cache.len() > 600 {

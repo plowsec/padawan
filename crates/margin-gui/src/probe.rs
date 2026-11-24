@@ -61,6 +61,9 @@ pub struct Probe {
     pub paths_selected: Option<String>,
     pub preview_on: bool,
     pub preview_parsed: bool,
+    /// Text runs of the preview drawn last frame, and its selection as text.
+    pub preview_text: Vec<egui::Rect>,
+    pub preview_selection: String,
     pub edit_log: Vec<EditAction>,
     pub active_untitled: Option<u32>,
     pub menu_bar: bool,
@@ -154,6 +157,8 @@ impl App {
             paths_selected: self.paths.as_ref().and_then(|p| p.selected_loc()),
             preview_on: f.and_then(|f| f.preview.as_ref()).is_some_and(|p| p.on),
             preview_parsed: f.and_then(|f| f.preview.as_ref()).is_some_and(|p| p.doc.is_some()),
+            preview_text: f.and_then(|f| f.preview.as_ref()).filter(|p| p.on).map(|p| p.state.text_rects()).unwrap_or_default(),
+            preview_selection: f.and_then(|f| f.preview.as_ref()).and_then(|p| p.doc.as_ref().map(|d| p.state.selected_text(d))).unwrap_or_default(),
             edit_log: self.edit_log.clone(),
             active_untitled: f.and_then(|f| f.untitled),
             menu_bar: self.settings.menu_bar,

@@ -771,6 +771,13 @@ impl App {
     }
 
     pub(crate) fn run_cmd(&mut self, c: Cmd) {
+        // Menu bar / palette Copy and Select All: the Markdown preview when it was used last.
+        if matches!(c, Cmd::Copy | Cmd::SelectAll) {
+            let on_preview = self.tabs.active_file().is_some_and(|f| f.doc().is_some() && f.preview.as_ref().is_some_and(|p| p.on && p.active));
+            if on_preview && self.active_id().is_some_and(|tab| self.md_edit(tab, c == Cmd::SelectAll)) {
+                return;
+            }
+        }
         if let Some(a) = edit_action(c) {
             self.edit(a);
             return;

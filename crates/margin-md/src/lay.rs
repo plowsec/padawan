@@ -18,6 +18,7 @@ use margin_code::{lex_line, LineState, TokenKind};
 use margin_theme::{mix, Theme};
 
 use crate::doc::{f, Alert, Align, Body, Inner, Leaf, Span, TextKind, NONE};
+use crate::sel::{Area, P};
 
 /// Content column: max width, side padding.
 pub const COL_MAX: f32 = 780.0;
@@ -253,18 +254,7 @@ pub fn text_laid(lx: &Lx<'_>, spans: &[Span], ts: TStyle, w: f32, fallback: &str
     let mut owned = String::new();
     for sp in spans {
         let linked = sp.link != NONE;
-        let text: &str = if sp.f & f::IMAGE != 0 {
-            let src = lx.doc.links.get(sp.img as usize).map_or("", |l| l.shown.as_str());
-            owned.clear();
-            owned.push_str("\u{2009}image: ");
-            owned.push_str(if sp.text.is_empty() { "(no alt)" } else { &sp.text });
-            owned.push_str(" \u{2014} ");
-            owned.push_str(crate::text::cap(src, 200));
-            owned.push('\u{2009}');
-            &owned
-        } else {
-            &sp.text
-        };
+        let text: &str = crate::sel::shown(lx.doc, sp, &mut owned);
         if text.is_empty() {
             continue;
         }
@@ -553,17 +543,53 @@ pub struct HitRec {
     pub k: u32,
 }
 
+/// What painting collects and needs besides the leaf: click areas, text areas, the selection.
+pub struct Px<'a> {
+    pub hits: &'a mut Vec<HitRec>,
+    pub areas: &'a mut Vec<Area>,
+    /// Ordered selection.
+    pub sel: Option<(P, P)>,
+    pub sel_color: Color32,
+    scratch: Vec<Rect>,
+}
+
+impl<'a> Px<'a> {
+    pub fn new(hits: &'a mut Vec<HitRec>, areas: &'a mut Vec<Area>, sel: Option<(P, P)>, sel_color: Color32) -> Self {
+        Px { hits, areas, sel, sel_color, scratch: Vec::new() }
+    }
+
+    /// Selection highlight of one galley (under its text) + its text area.
+    fn galley(&mut self, p: &Painter, g: &Arc<Galley>, pos: Pos2, clip: Rect, leaf: u32, unit: u32) {
+        let rect = Rect::from_min_size(pos, g.size()).intersect(clip);
+        if !rect.is_positive() {
+            return;
+        }
+        self.areas.push(Area { leaf, unit, pos, galley: g.clone(), rect });
+        let Some((a, b)) = self.sel.and_then(|s| crate::sel::span(s, leaf, unit)) else { return };
+        self.scratch.clear();
+        crate::sel::rects(g, a, b, &mut self.scratch);
+        for r in &self.scratch {
+            let r = r.translate(pos.to_vec2()).intersect(clip);
+            if r.is_positive() {
+                p.rect_filled(r, 0.0, self.sel_color);
+            }
+        }
+    }
+}
+
 fn snap(v: f32, ppp: f32) -> f32 {
     (v * ppp).round() / ppp + 0.5 / ppp
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn paint_text(p: &Painter, th: &Theme, t: &TextLaid, pos: Pos2, clip: Rect, leaf: u32, hits: &mut Vec<HitRec>, color: Color32) {
+pub fn paint_text(p: &Painter, th: &Theme, t: &TextLaid, pos: Pos2, clip: Rect, leaf: u32, unit: u32, px: &mut Px<'_>, color: Color32) {
     for d in &t.deco {
         if let Deco::Code(r) = d {
             p.rect_filled(r.translate(pos.to_vec2()), 3.0, th.ui.row_hover);
         }
     }
+    px.galley(p, &t.galley, pos, clip, leaf, unit);
+    let hits = &mut *px.hits;
     p.galley(pos, t.galley.clone(), color);
     for d in &t.deco {
         match d {
@@ -583,7 +609,7 @@ pub fn paint_text(p: &Painter, th: &Theme, t: &TextLaid, pos: Pos2, clip: Rect, 
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn paint_code(p: &Painter, th: &Theme, sty: &Sty, l: &Laid, body: &Body, x: f32, y: f32, w: f32) {
+pub fn paint_code(p: &Painter, th: &Theme, sty: &Sty, l: &Laid, body: &Body, x: f32, y: f32, w: f32, leaf: u32, px: &mut Px<'_>) {
     let Laid::Code { g, label, top, h, .. } = l else { return };
     let Body::Code { first, last, .. } = body else { return };
     let ppp = p.pixels_per_point();
@@ -609,11 +635,13 @@ pub fn paint_code(p: &Painter, th: &Theme, sty: &Sty, l: &Laid, body: &Body, x: 
     if let Some(lg) = label {
         p.galley(pos2(r.right() - sty.code_px * 0.7 - lg.size().x, r.top() + 5.0), lg.clone(), th.ui.text_faint);
     }
-    p.galley(pos2(x + sty.code_px, y + top), g.clone(), th.code.text);
+    let pos = pos2(x + sty.code_px, y + top);
+    px.galley(p, g, pos, p.clip_rect(), leaf, 0);
+    p.galley(pos, g.clone(), th.code.text);
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn paint_table(p: &Painter, lx: &Lx<'_>, l: &Laid, body: &Body, x: f32, y: f32, w: f32, sx: f32, leaf: u32, hits: &mut Vec<HitRec>) {
+pub fn paint_table(p: &Painter, lx: &Lx<'_>, l: &Laid, body: &Body, x: f32, y: f32, w: f32, sx: f32, leaf: u32, px: &mut Px<'_>) {
     let Laid::Table { rows, cols, h, last, .. } = l else { return };
     let Body::Table { tid, .. } = body else { return };
     let th = lx.th;
@@ -627,7 +655,8 @@ pub fn paint_table(p: &Painter, lx: &Lx<'_>, l: &Laid, body: &Body, x: f32, y: f
     let tx = x - sx;
     let line = Stroke::new(1.0, th.ui.border);
     let rows_end = rows.last().map_or(0.0, |r| r.y + r.h);
-    for row in rows {
+    let ncols = cols.w.len().max(1);
+    for (ri, row) in rows.iter().enumerate() {
         let ry = y + row.y;
         if ry > clip.bottom() || ry + row.h < clip.top() {
             continue;
@@ -648,7 +677,7 @@ pub fn paint_table(p: &Painter, lx: &Lx<'_>, l: &Laid, body: &Body, x: f32, y: f
             };
             let pos = pos2((cx + sty.cell_px + off).round(), (ry + sty.cell_py).round());
             let color = if row.header { th.ui.text_strong } else { th.ui.text };
-            paint_text(&pc, th, cell, pos, clip, leaf, hits, color);
+            paint_text(&pc, th, cell, pos, clip, leaf, (ri * ncols + c) as u32, px, color);
             cx += cw;
         }
         let mut vx = tx;
