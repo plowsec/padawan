@@ -124,6 +124,14 @@ pub fn close_x(p: &Painter, c: Pos2, s: f32, color: Color32) {
     p.line_segment([pos2(c.x - s, c.y + s), pos2(c.x + s, c.y - s)], st);
 }
 
+/// Two panes side by side.
+pub fn split_icon(p: &Painter, c: Pos2, color: Color32) {
+    let r = Rect::from_center_size(c, egui::vec2(13.0, 11.0));
+    let st = Stroke::new(1.2, color);
+    p.rect_stroke(r, CornerRadius::same(2), st, egui::StrokeKind::Inside);
+    p.line_segment([pos2(c.x, r.top() + 1.0), pos2(c.x, r.bottom() - 1.0)], st);
+}
+
 pub fn dot(p: &Painter, c: Pos2, r: f32, color: Color32) {
     p.circle_filled(c, r, color);
 }

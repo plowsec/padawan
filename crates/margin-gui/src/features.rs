@@ -37,9 +37,13 @@ pub enum CtxAct {
     Delete(RelPath, bool),
     NewWindow(RelPath),
     Open(RelPath),
-    CloseTab(u64),
-    CloseOthers(u64),
-    CloseAll,
+    /// Tab `.1` of group `.0`.
+    CloseTab(u32, u64),
+    CloseOthers(u32, u64),
+    /// Every tab of the group.
+    CloseAll(u32),
+    /// Focus tab `.1` of group `.0`, then run the command.
+    TabCmd(u32, u64, crate::commands::Cmd),
     /// Copy the selection of the Markdown preview of tab.
     MdCopy(u64),
     MdSelectAll(u64),
@@ -245,6 +249,9 @@ impl App {
                         f.preview = None;
                     } else if f.preview.is_none() {
                         f.preview = Some(Box::new(Preview { on: md, ..Default::default() }));
+                        for a in &mut f.alts {
+                            a.pv.on = md;
+                        }
                     }
                     f.focus_editor = true;
                 }
@@ -420,10 +427,24 @@ impl App {
         self.open_ctx(pos, items);
     }
 
-    pub(crate) fn open_tab_menu(&mut self, id: u64, pos: Pos2) {
-        let path = self.tabs.by_id(id).and_then(|i| self.tabs.list[i].file()).filter(|f| !f.is_untitled()).map(|f| f.path.clone());
-        let many = self.tabs.list.len() > 1;
-        let mut items = vec![item("Close", CtxAct::CloseTab(id)), (MenuEntry::item("Close Others", "", many), Some(CtxAct::CloseOthers(id))), item("Close All", CtxAct::CloseAll)];
+    /// Right-click on tab `id` in the strip of group `group`.
+    pub(crate) fn open_tab_menu(&mut self, group: u32, id: u64, pos: Pos2) {
+        use crate::commands::Cmd;
+        let tab = self.tabs.by_id(id).map(|i| &self.tabs.list[i]);
+        let is_file = tab.is_some_and(|t| t.file().is_some());
+        let path = tab.and_then(|t| t.file()).filter(|f| !f.is_untitled()).map(|f| f.path.clone());
+        let in_group = self.tabs.group_index(group).map_or(0, |g| self.tabs.groups[g].tabs.len());
+        let groups = self.tabs.groups.len();
+        let room = groups < crate::tabs::MAX_GROUPS;
+        let key = |c: Cmd| crate::commands::shortcut(c, self.mac);
+        let cmd = |label: &str, c: Cmd, on: bool| (MenuEntry::item(label, key(c), on), Some(CtxAct::TabCmd(group, id, c)));
+        let mut items = vec![item("Close", CtxAct::CloseTab(group, id)), (MenuEntry::item("Close Others", "", in_group > 1), Some(CtxAct::CloseOthers(group, id))), item("Close All", CtxAct::CloseAll(group))];
+        items.push(sep());
+        items.push(cmd("Split Right", Cmd::SplitRight, is_file && room));
+        items.push(cmd("Split Down", Cmd::SplitDown, is_file && room));
+        let movable = groups > 1 || (in_group > 1 && room);
+        items.push(cmd("Move to Next Group", Cmd::MoveTabRight, movable));
+        items.push(cmd("Move to Previous Group", Cmd::MoveTabLeft, movable));
         if let Some(p) = path {
             items.push(sep());
             items.push(item("Copy Path", CtxAct::CopyAbs(p.clone())));
@@ -528,14 +549,20 @@ impl App {
                 }
             }
             CtxAct::Open(p) => self.open_file(p, None, true),
-            CtxAct::CloseTab(id) => self.close_tab(id),
-            CtxAct::CloseOthers(id) => {
-                let ids: Vec<u64> = self.tabs.list.iter().map(|t| t.id).filter(|x| *x != id).collect();
-                self.close_many(ids);
+            CtxAct::CloseTab(group, id) => self.close_view(group, id),
+            CtxAct::CloseOthers(group, keep) => {
+                let ids: Vec<u64> = self.tabs.group_index(group).map(|g| self.tabs.groups[g].tabs.iter().copied().filter(|x| *x != keep).collect()).unwrap_or_default();
+                self.close_many(group, ids);
             }
-            CtxAct::CloseAll => {
-                let ids: Vec<u64> = self.tabs.list.iter().map(|t| t.id).collect();
-                self.close_many(ids);
+            CtxAct::CloseAll(group) => {
+                let ids: Vec<u64> = self.tabs.group_index(group).map(|g| self.tabs.groups[g].tabs.clone()).unwrap_or_default();
+                self.close_many(group, ids);
+            }
+            CtxAct::TabCmd(group, id, c) => {
+                if let Some(g) = self.tabs.group_index(group) {
+                    self.tabs.activate_in(g, id);
+                    self.run_cmd(c);
+                }
             }
             CtxAct::MdCopy(tab) => {
                 self.md_edit(tab, false);
@@ -546,14 +573,17 @@ impl App {
         }
     }
 
-    /// Close tabs: clean ones now; unsaved files → one prompt; untitled buffers with text stay open.
-    fn close_many(&mut self, ids: Vec<u64>) {
+    /// Close tabs of group `group`: clean ones (and ones open in another group too) now; unsaved files → one
+    /// prompt; untitled buffers with text stay open.
+    fn close_many(&mut self, group: u32, ids: Vec<u64>) {
         let mut kept_untitled = 0;
         let mut dirty = Vec::new();
         for id in ids {
             let Some(i) = self.tabs.by_id(id) else { continue };
             let tab = &self.tabs.list[i];
-            if !tab.dirty() {
+            if self.tabs.views(id) > 1 {
+                self.close_view(group, id);
+            } else if !tab.dirty() {
                 self.close_tab_now(id);
             } else if tab.file().is_some_and(FileTab::is_untitled) {
                 kept_untitled += 1;
@@ -582,16 +612,27 @@ impl App {
         f.focus_editor = true;
     }
 
-    /// Parse the active tab's preview when due. Returns the wait until the next parse.
+    /// Parse the previews on screen when due. Returns the wait until the next parse.
     pub(crate) fn update_preview(&mut self) -> Option<f64> {
+        let mut wait: Option<f64> = None;
+        for id in self.tabs.visible() {
+            if let Some(w) = self.update_preview_of(id) {
+                wait = Some(wait.map_or(w, |x| x.min(w)));
+            }
+        }
+        wait
+    }
+
+    fn update_preview_of(&mut self, tab: u64) -> Option<f64> {
         let now = self.now;
         let tx = self.md_tx.clone();
         let wake = waker(&self.ctx);
-        let ai = self.tabs.active?;
-        let tab = self.tabs.list.get(ai)?.id;
-        let f = self.tabs.list.get_mut(ai)?.file_mut()?;
+        let f = self.tabs.file_by_id(tab)?;
+        if !f.preview_wanted() {
+            return None;
+        }
         let View::Text(d) = &f.view else { return None };
-        let pv = f.preview.as_mut().filter(|p| p.on)?;
+        let pv = f.preview.as_mut()?;
         let rev = d.revision();
         let (go, wait) = pv.due(rev, now);
         if !go {

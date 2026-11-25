@@ -9,6 +9,7 @@
 //! | task box | `[ ]` ⇄ `[x]` on that source line, one undo step |
 //! | copy, select all | go to the preview while it is the pane used last (`active`), else to the editor |
 //! | secondary click | menu: Copy, Copy Link (on a link), Select All |
+//! | file in several groups | one parsed document; on/off, scroll, selection per group (`PvView`) |
 
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -44,6 +45,16 @@ pub struct Preview {
     pub active: bool,
 }
 
+/// The part of `Preview` each group showing the file has for itself.
+#[derive(Default)]
+pub struct PvView {
+    pub on: bool,
+    pub state: PreviewState,
+    pub editor_top: Option<u32>,
+    pub show_editor: bool,
+    pub active: bool,
+}
+
 pub struct MdDone {
     pub tab: u64,
     pub rev: u64,
@@ -66,6 +77,15 @@ impl Preview {
             return (false, Some(left));
         }
         (true, None)
+    }
+
+    /// Exchange the per-group part with `v`.
+    pub fn swap_view(&mut self, v: &mut PvView) {
+        std::mem::swap(&mut self.on, &mut v.on);
+        std::mem::swap(&mut self.state, &mut v.state);
+        std::mem::swap(&mut self.editor_top, &mut v.editor_top);
+        std::mem::swap(&mut self.show_editor, &mut v.show_editor);
+        std::mem::swap(&mut self.active, &mut v.active);
     }
 
     pub fn apply(&mut self, rev: u64, doc: Arc<MdDoc>) {

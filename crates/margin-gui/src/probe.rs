@@ -15,7 +15,16 @@ pub struct Probe {
     pub open_error: Option<String>,
     /// Tree rows as `(path, depth)`.
     pub tree: Vec<(String, u16)>,
+    /// Tab titles of the focused group, strip order.
     pub tabs: Vec<String>,
+    /// Tab titles of every group, in layout order; the active tab's title; the group's rect last frame.
+    pub groups: Vec<(Vec<String>, Option<String>, egui::Rect)>,
+    /// Index into `groups` of the focused one.
+    pub group: usize,
+    /// Group ids in layout order (widget ids).
+    pub group_ids: Vec<u32>,
+    /// Open buffers (a file shown in two groups counts once).
+    pub buffers: usize,
     pub active: Option<String>,
     pub active_text: Option<String>,
     pub active_dirty: bool,
@@ -84,13 +93,27 @@ impl App {
     pub fn probe(&self) -> Probe {
         let f = self.tabs.active_file();
         let doc = f.and_then(|f| f.doc());
+        let title = |id: u64| self.tabs.by_id(id).map(|i| self.tabs.list[i].title()).unwrap_or_default();
+        let order = self.tabs.order();
         let search = self.tabs.active_tab().and_then(|t| t.search()).or_else(|| self.tabs.list.iter().rev().find_map(|t| t.search()));
         Probe {
             folder: self.ws.as_ref().map(|w| w.display_name()),
             fatal: self.ws.as_ref().and_then(|w| w.fatal.clone()),
             open_error: self.open_error.clone(),
             tree: self.tree.rows.iter().map(|r| (r.path.to_string(), r.depth)).collect(),
-            tabs: self.tabs.list.iter().map(|t| t.title()).collect(),
+            tabs: self.tabs.groups[self.tabs.cur].tabs.iter().map(|id| title(*id)).collect(),
+            groups: order
+                .iter()
+                .filter_map(|id| self.tabs.group_index(*id))
+                .map(|g| {
+                    let g = &self.tabs.groups[g];
+                    let rect = self.group_rects.iter().find(|(id, _)| *id == g.id).map_or(egui::Rect::NOTHING, |x| x.1);
+                    (g.tabs.iter().map(|id| title(*id)).collect(), g.active.map(title), rect)
+                })
+                .collect(),
+            group: order.iter().position(|id| *id == self.tabs.groups[self.tabs.cur].id).unwrap_or(0),
+            group_ids: order.clone(),
+            buffers: self.tabs.list.len(),
             active: self.tabs.active_tab().map(|t| t.title()),
             active_text: doc.map(|d| d.text()),
             active_dirty: doc.is_some_and(|d| d.is_dirty()),

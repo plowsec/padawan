@@ -1,5 +1,6 @@
-//! The window: menu bar, sidebar (search box + files), tabs (files, untitled, search, settings), editor | Markdown preview,
-//! bottom panel (results, call paths), palette, context menus, status bar.
+//! The window: menu bar, sidebar (search box + files), editor groups (split right / down; each with its tabs: files,
+//! untitled, search, settings) showing editor | Markdown preview, bottom panel (results, call paths), palette,
+//! context menus, status bar.
 //!
 //! PUBLIC API IS FROZEN: `RunOpts`, `run`. Added: `App` (`App::new`, `App::ui`, `App::probe` for tests).
 //!
@@ -49,7 +50,7 @@ mod welcome;
 pub mod widgets;
 pub mod workspace;
 
-pub use app::{preview_divider_id, preview_toggle_id, App};
+pub use app::{group_divider_id, preview_divider_id, preview_toggle_id, split_button_id, App};
 pub use features::ctx_menu_id;
 pub use ops::save_as_id;
 pub use probe::Probe;

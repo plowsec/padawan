@@ -19,8 +19,8 @@ use crate::picker::{Picker, PickerOut};
 use crate::results_panel::ResultsPanel;
 use crate::sanitize::{clean, floor_char, sanitize};
 use crate::side::SideMode;
-use crate::state::FolderTabs;
-use crate::tabs::{Banner, FileTab, TabKind, View};
+use crate::state::{FolderTabs, GroupTabs};
+use crate::tabs::{Banner, FileTab, TabKind, View, MAX_GROUPS};
 use crate::tree::{EditKind, TreeAction};
 use crate::widgets;
 use crate::workspace::{Pending, Workspace};
@@ -379,7 +379,11 @@ impl App {
             }
         }
         if f.preview.is_none() && f.markdown() {
-            f.preview = Some(Box::new(crate::md_preview::Preview { on: self.settings.md_preview, ..Default::default() }));
+            let on = self.settings.md_preview;
+            f.preview = Some(Box::new(crate::md_preview::Preview { on, ..Default::default() }));
+            for a in &mut f.alts {
+                a.pv.on = on;
+            }
         }
         if let Some(frag) = f.pending_anchor.take() {
             self.jump_anchor(d.tab, &frag);
@@ -435,26 +439,34 @@ impl App {
             return;
         }
         self.restored = true;
-        let mut active = None;
         if self.settings.restore_tabs {
             if let Some(ft) = self.state.tabs_of(root).cloned() {
-                for t in &ft.tabs {
-                    if let Ok(p) = RelPath::new(t) {
-                        self.open_file(p, None, false);
+                // Group 0 = the focused group (it may hold untitled buffers); the others are made next to it.
+                let ids = self.tabs.restore_groups(1 + ft.more.len(), &ft.layout);
+                let first = GroupTabs { tabs: ft.tabs, active: ft.active };
+                for (g, id) in std::iter::once(&first).chain(ft.more.iter()).zip(&ids) {
+                    if let Some(gi) = self.tabs.group_index(*id) {
+                        self.tabs.focus_group(gi);
+                    }
+                    // The active one last: it ends up in front.
+                    for t in g.tabs.iter().filter(|t| Some(*t) != g.active.as_ref()).chain(g.active.iter()) {
+                        if let Ok(p) = RelPath::new(t) {
+                            self.open_file(p, None, false);
+                        }
                     }
                 }
-                active = ft.active.and_then(|a| RelPath::new(&a).ok());
+                self.tabs.prune();
+                if let Some(gi) = ids.get(ft.focus).and_then(|id| self.tabs.group_index(*id)) {
+                    self.tabs.focus_group(gi);
+                }
             }
         }
         if let Some(f) = self.start_file.take() {
             let f = f.replace('\\', "/");
             match RelPath::new(f.trim_start_matches("./")) {
-                Ok(p) if !p.is_root() => active = Some(p),
+                Ok(p) if !p.is_root() => self.open_file(p, None, false),
                 _ => self.toasts.error("The file to open is not inside the folder"),
             }
-        }
-        if let Some(a) = active {
-            self.open_file(a, None, false);
         }
         self.tabs_changed = true;
     }
@@ -464,9 +476,12 @@ impl App {
         if !self.restored || ws.root.is_none() {
             return;
         }
-        let tabs: Vec<String> = self.tabs.list.iter().filter_map(|t| t.file().filter(|f| !f.is_untitled()).map(|f| f.path.to_string())).collect();
-        let active = self.tabs.active_file().filter(|f| !f.is_untitled()).map(|f| f.path.to_string());
-        let ft = FolderTabs { root: ws.root_str(), tabs, active };
+        let path_of = |id: u64| self.tabs.by_id(id).and_then(|i| self.tabs.list[i].file()).filter(|f| !f.is_untitled()).map(|f| f.path.to_string());
+        let mut groups: Vec<GroupTabs> = self.tabs.groups.iter().map(|g| GroupTabs { tabs: g.tabs.iter().filter_map(|id| path_of(*id)).collect(), active: g.active.and_then(path_of) }).collect();
+        let many = groups.len() > 1;
+        let first = groups.remove(0);
+        let layout = if many { self.tabs.layout.write(&|id| self.tabs.group_index(id)) } else { String::new() };
+        let ft = FolderTabs { root: ws.root_str(), tabs: first.tabs, active: first.active, more: groups, layout, focus: self.tabs.cur };
         if self.state.tabs_of(&ft.root) != Some(&ft) {
             self.state.set_tabs(ft);
             self.state_at = Some(self.now);
@@ -555,7 +570,7 @@ impl App {
             }
         }
         if let Some(i) = self.tabs.find_file(&path) {
-            self.tabs.activate(i);
+            self.tabs.show(i);
             if let Some(f) = self.tabs.list[i].file_mut() {
                 f.focus_editor = true;
                 if let Some((l, c, n)) = select {
@@ -612,6 +627,19 @@ impl App {
         }
     }
 
+    /// Close the tab of `id` in group `group`. The buffer closes with its last tab (asks about unsaved edits).
+    pub(crate) fn close_view(&mut self, group: u32, id: u64) {
+        if self.tabs.views(id) > 1 {
+            self.tabs.remove_view(group, id);
+            self.tabs_changed = true;
+            self.focus_editor = true;
+            self.ctx.request_repaint();
+        } else {
+            self.close_tab(id);
+        }
+    }
+
+    /// Close buffer `id` (every group), asking about unsaved edits.
     pub(crate) fn close_tab(&mut self, id: u64) {
         let Some(i) = self.tabs.by_id(id) else { return };
         if self.tabs.list[i].dirty() {
@@ -640,6 +668,7 @@ impl App {
             }
             self.tabs_changed = true;
             self.focus_editor = true;
+            self.ctx.request_repaint();
         }
     }
 
@@ -857,20 +886,48 @@ impl App {
                 }
             }
             Cmd::CloseTab => {
-                if let Some(id) = self.active_id() {
-                    self.close_tab(id);
+                let g = &self.tabs.groups[self.tabs.cur];
+                if let (gid, Some(id)) = (g.id, g.active) {
+                    self.close_view(gid, id);
                 }
             }
-            Cmd::NextTab => {
-                self.tabs.cycle(1);
+            Cmd::NextTab | Cmd::PrevTab => {
+                self.tabs.cycle(if c == Cmd::NextTab { 1 } else { -1 });
                 self.focus_editor = true;
+                self.tabs_changed = true;
             }
-            Cmd::PrevTab => {
-                self.tabs.cycle(-1);
-                self.focus_editor = true;
+            Cmd::SplitRight | Cmd::SplitDown => {
+                if self.tabs.split(c == Cmd::SplitDown) {
+                    self.group_changed();
+                }
+            }
+            Cmd::FocusGroup1 | Cmd::FocusGroup2 | Cmd::FocusGroup3 => {
+                let n = group_number(c);
+                let order = self.tabs.order();
+                match order.get(n).and_then(|id| self.tabs.group_index(*id)) {
+                    Some(g) => self.tabs.focus_group(g),
+                    // The first missing number: split the last group.
+                    None if n == order.len() => {
+                        if let Some(g) = order.last().and_then(|id| self.tabs.group_index(*id)) {
+                            self.tabs.focus_group(g);
+                        }
+                        self.tabs.split(false);
+                    }
+                    None => return,
+                }
+                self.group_changed();
+            }
+            Cmd::FocusNextGroup | Cmd::FocusPrevGroup => {
+                self.tabs.focus_step(if c == Cmd::FocusNextGroup { 1 } else { -1 });
+                self.group_changed();
+            }
+            Cmd::MoveTabRight | Cmd::MoveTabLeft => {
+                if self.tabs.move_active(if c == Cmd::MoveTabRight { 1 } else { -1 }) {
+                    self.group_changed();
+                }
             }
             Cmd::Find | Cmd::Replace => {
-                if let Some(s) = self.tabs.active.and_then(|a| self.tabs.list.get_mut(a)).and_then(|t| t.search_mut()) {
+                if let Some(s) = self.tabs.active().and_then(|a| self.tabs.list.get_mut(a)).and_then(|t| t.search_mut()) {
                     // In a search tab: show its replace row.
                     s.show_replace = true;
                     if c == Cmd::Replace {
@@ -1003,7 +1060,7 @@ impl App {
                 self.settings_changed(false);
             }
             Cmd::Settings => match self.tabs.list.iter().position(|t| matches!(t.kind, TabKind::Settings)) {
-                Some(i) => self.tabs.activate(i),
+                Some(i) => self.tabs.show(i),
                 None => {
                     self.tabs.add(TabKind::Settings);
                 }
@@ -1042,6 +1099,13 @@ impl App {
         }
     }
 
+    /// Groups or their focus changed: the focused editor takes the keyboard, the layout is saved.
+    pub(crate) fn group_changed(&mut self) {
+        self.focus_editor = true;
+        self.tabs_changed = true;
+        self.ctx.request_repaint();
+    }
+
     fn show_sidebar(&mut self) {
         if !self.state.sidebar_visible {
             self.state.sidebar_visible = true;
@@ -1076,7 +1140,14 @@ impl App {
             Cmd::Save => self.tabs.active_tab().is_some_and(|t| t.dirty()),
             Cmd::SaveAll => !self.dirty_file_tabs().is_empty(),
             Cmd::RevertFile | Cmd::CopyPath | Cmd::CopyRelPath => file,
-            Cmd::CloseTab | Cmd::NextTab | Cmd::PrevTab => !self.tabs.list.is_empty(),
+            Cmd::CloseTab | Cmd::NextTab | Cmd::PrevTab => self.tabs.active().is_some(),
+            Cmd::SplitRight | Cmd::SplitDown => self.can_split(),
+            Cmd::FocusGroup1 | Cmd::FocusGroup2 | Cmd::FocusGroup3 => {
+                let (n, have) = (group_number(c), self.tabs.groups.len());
+                n < have || (n == have && self.can_split())
+            }
+            Cmd::FocusNextGroup | Cmd::FocusPrevGroup => self.tabs.groups.len() > 1,
+            Cmd::MoveTabRight | Cmd::MoveTabLeft => self.tabs.active().is_some() && (self.tabs.groups.len() > 1 || self.tabs.groups[self.tabs.cur].tabs.len() > 1),
             Cmd::CloseFolder | Cmd::GoToFile | Cmd::SearchFolder | Cmd::ReplaceFolder | Cmd::ShowFiles | Cmd::RebuildIndex | Cmd::NewFileInFolder | Cmd::NewFolder => ws,
             Cmd::GoToDef | Cmd::FindCallers => ws && text,
             Cmd::Back => !self.back.is_empty(),
@@ -1085,6 +1156,11 @@ impl App {
             Cmd::ToggleSidebar => ws,
             _ => true,
         }
+    }
+
+    /// The focused tab is a file and there is room for a group.
+    pub(crate) fn can_split(&self) -> bool {
+        self.tabs.active_file().is_some() && self.tabs.groups.len() < MAX_GROUPS
     }
 
     fn close_palette(&mut self) {
@@ -1168,14 +1244,21 @@ impl App {
         }
     }
 
-    /// Schedule outline / lens work for the active tab. Returns seconds until the next check.
+    /// Schedule outline / lens work for the tabs on screen. Returns seconds until the next check.
     pub(crate) fn update_hints(&mut self) -> Option<f64> {
+        let mut wait: Option<f64> = None;
+        for id in self.tabs.visible() {
+            if let Some(w) = self.update_hints_of(id) {
+                wait = Some(wait.map_or(w, |x| x.min(w)));
+            }
+        }
+        wait
+    }
+
+    fn update_hints_of(&mut self, id: u64) -> Option<f64> {
         let now = self.now;
         let want_lens = self.settings.code_hints;
-        let ai = self.tabs.active?;
-        let tab = self.tabs.list.get_mut(ai)?;
-        let id = tab.id;
-        let f = tab.file_mut()?;
+        let f = self.tabs.file_by_id(id)?;
         let View::Text(doc) = &f.view else { return None };
         let lang = doc.lang();
         if !lang.has_outline() || doc.len_bytes() > hints::MAX_OUTLINE_BYTES {
@@ -1523,6 +1606,15 @@ pub fn save_as_check(text: &str) -> Result<RelPath, String> {
     match RelPath::new(s) {
         Ok(p) if !p.is_root() => Ok(p),
         _ => Err("Not a path inside the folder".to_owned()),
+    }
+}
+
+/// 0-based group of a `FocusGroupN` command.
+fn group_number(c: Cmd) -> usize {
+    match c {
+        Cmd::FocusGroup1 => 0,
+        Cmd::FocusGroup2 => 1,
+        _ => 2,
     }
 }
 

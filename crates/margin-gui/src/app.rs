@@ -5,7 +5,8 @@
 //! 2. window focus, dropped files, close requests
 //! 3. shortcuts (consumed before anything else sees them)
 //! 4. overlays (modal > picker > palette > context menu > menu bar menu); if one is open, remaining keyboard input is dropped
-//! 5. layout: menu bar, status bar, sidebar, tab strip, tab body (editor | preview, search, settings), bottom panel; toasts
+//! 5. layout: menu bar, status bar, sidebar, bottom panel, editor groups (each: tab strip, then editor | preview, search
+//!    or settings), dividers; toasts
 //! 6. timers: names / search / palette debounce, hints, Markdown parse, hot exit, settings + state saves (`request_repaint_after`)
 
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ use crate::settings::Settings;
 use crate::side::{SideOut, SideSearch};
 use crate::state::{Persist, SavedState, SIDEBAR_W};
 use crate::status::{self, StatusInfo};
-use crate::tabs::{Banner, StripAction, TabKind, Tabs, View};
+use crate::tabs::{tab_id, Banner, DropAt, StripAction, TabKind, Tabs, View, MAX_GROUPS};
 use crate::toast::Toasts;
 use crate::tree::Tree;
 use crate::welcome::{self, WelcomeOut};
@@ -178,6 +179,12 @@ pub struct App {
     pub(crate) inject_md: Vec<PreviewOutput>,
     /// Open modal's title and buttons last frame (tests).
     pub(crate) modal_seen: (String, Vec<(String, Rect)>),
+    /// Group id → its rect last frame.
+    pub(crate) group_rects: Vec<(u32, Rect)>,
+    /// A click moved the focus to another group: once the button is up, see that something has the keyboard.
+    pub(crate) refocus: bool,
+    /// Tab being dragged: `(group, tab)`.
+    pub(crate) tab_drag: Option<(u32, u64)>,
 }
 
 pub(crate) fn waker(ctx: &egui::Context) -> Waker {
@@ -250,6 +257,9 @@ impl App {
             edit_log: Vec::new(),
             inject_md: Vec::new(),
             modal_seen: Default::default(),
+            group_rects: Vec::new(),
+            refocus: false,
+            tab_drag: None,
         };
         app.restore_untitled();
         if let Some(f) = opts.folder {
@@ -406,46 +416,7 @@ impl App {
             }
             return;
         }
-        let strip_h = (t.row_h() + 8.0).round();
-        let mut y = rect.top();
-        if !self.tabs.list.is_empty() {
-            let sr = Rect::from_min_size(rect.min, vec2(rect.width(), strip_h));
-            let md = self.tabs.active_file().is_some_and(|f| f.doc().is_some() && f.markdown());
-            let tog_w = if md { 84.0 } else { 0.0 };
-            let strip_r = sr.with_max_x(sr.right() - tog_w);
-            let act = self.tabs.strip(ui, strip_r, t);
-            if md {
-                let tr = Rect::from_min_max(pos2(strip_r.right(), sr.top()), sr.max);
-                ui.painter().rect_filled(tr, 0.0, t.ui.panel_bg);
-                ui.painter().hline(tr.x_range(), tr.bottom() - 0.5, t.border());
-                ui.painter().vline(tr.left() + 0.5, tr.y_range(), t.border());
-                let mut on = self.tabs.active_file().and_then(|f| f.preview.as_ref()).is_some_and(|p| p.on);
-                let br = Rect::from_center_size(tr.center(), vec2(64.0, (t.row_h() - 2.0).round()));
-                if widgets::text_toggle(ui, br, "Preview", &mut on, "Markdown preview", t, preview_toggle_id()) {
-                    self.run_cmd(Cmd::MdPreview);
-                }
-            }
-            match act {
-                Some(StripAction::Activate(i)) => {
-                    self.tabs.activate(i);
-                    self.focus_editor = true;
-                    self.tabs_changed = true;
-                }
-                Some(StripAction::Close(i)) => {
-                    if let Some(id) = self.tabs.list.get(i).map(|x| x.id) {
-                        self.close_tab(id);
-                    }
-                }
-                Some(StripAction::Menu(i, pos)) => {
-                    if let Some(id) = self.tabs.list.get(i).map(|x| x.id) {
-                        self.open_tab_menu(id, pos);
-                    }
-                }
-                None => {}
-            }
-            y = sr.bottom();
-        }
-        let mut area = Rect::from_min_max(pos2(rect.left(), y), rect.max);
+        let mut area = rect;
         // Fatal banner.
         if let Some(msg) = self.ws.as_ref().and_then(|w| w.fatal.clone()) {
             let br = Rect::from_min_size(area.min, vec2(area.width(), (t.row_h() + 10.0).round()));
@@ -495,7 +466,197 @@ impl App {
                 }
             }
         }
-        self.editor_area(ui, editor_r, t);
+        self.groups_area(ui, editor_r, t);
+        let panel = self.results.is_some() || self.paths.is_some();
+        if panel && ui.input(|i| i.key_pressed(Key::Escape)) && !self.tabs.active_file().is_some_and(|f| f.st.find_open()) {
+            self.results = None;
+            self.paths = None;
+        }
+    }
+
+    /// The editor groups in `rect`, and the dividers between them.
+    fn groups_area(&mut self, ui: &mut Ui, rect: Rect, t: &Theme) {
+        let (mut places, mut divs) = (Vec::new(), Vec::new());
+        self.tabs.layout.place(rect, &mut Vec::new(), &mut places, &mut divs);
+        // A press inside a group focuses it.
+        if !self.any_overlay() {
+            let press = ui.input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None });
+            let hit = press.and_then(|p| places.iter().find(|(_, r)| r.contains(p))).and_then(|(id, _)| self.tabs.group_index(*id));
+            if let Some(g) = hit.filter(|g| *g != self.tabs.cur) {
+                self.tabs.focus_group(g);
+                self.group_changed();
+                self.refocus = true;
+            }
+        }
+        // That click may have landed on nothing that takes the keyboard (the strip): the group's editor gets it.
+        if self.refocus {
+            if ui.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+                ui.ctx().request_repaint();
+            } else {
+                self.refocus = false;
+                if ui.memory(|m| m.focused().is_none()) && !self.any_overlay() {
+                    self.focus_editor = true;
+                }
+            }
+        }
+        for (id, r) in &places {
+            // Groups come and go while they are drawn (a tab closed, a split).
+            if self.tabs.group_index(*id).is_some() {
+                self.group_ui(ui, *id, *r, t);
+            }
+        }
+        self.tabs.sync();
+        self.tab_drop(ui, &places, t);
+        self.group_rects = places;
+        for d in divs {
+            let line = d.rect.center();
+            if d.down {
+                ui.painter().hline(d.rect.x_range(), line.y, t.border());
+            } else {
+                ui.painter().vline(line.x, d.rect.y_range(), t.border());
+            }
+            let h = ui.interact(d.rect, group_divider_id(&d.path, d.index), Sense::drag()).on_hover_cursor(if d.down { CursorIcon::ResizeVertical } else { CursorIcon::ResizeHorizontal });
+            if h.dragged() {
+                let px = if d.down { h.drag_delta().y } else { h.drag_delta().x };
+                self.tabs.layout.resize(&d.path, d.index, px, d.span);
+                self.tabs_changed = true;
+            }
+        }
+    }
+
+    /// A tab is being dragged: show where it would land; on release, move it there.
+    ///
+    /// | Pointer over | Lands |
+    /// |---|---|
+    /// | a tab strip | in that group, at that position |
+    /// | outer quarter of a group's body | in a new group on that side |
+    /// | the rest of the body | in that group |
+    fn tab_drop(&mut self, ui: &mut Ui, places: &[(u32, Rect)], t: &Theme) {
+        let Some((from, id)) = self.tab_drag else { return };
+        let (pos, down, esc) = ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down(), i.key_pressed(Key::Escape)));
+        let title = self.tabs.by_id(id).map(|i| self.tabs.list[i].title());
+        let (Some(title), false) = (title, esc || self.any_overlay()) else {
+            self.tab_drag = None;
+            return;
+        };
+        let strip_h = (t.row_h() + 8.0).round();
+        let target = pos.and_then(|p| places.iter().find(|(_, r)| r.contains(p)).map(|(g, r)| (p, *g, *r))).and_then(|(p, gid, r)| {
+            let g = self.tabs.group_index(gid)?;
+            let body = r.with_min_y((r.top() + strip_h).min(r.bottom()));
+            if !body.contains(p) {
+                // Strip: before the first tab whose middle is right of the pointer.
+                let rects: Vec<Rect> = self.tabs.groups[g].tabs.iter().filter_map(|tid| ui.ctx().read_response(tab_id(gid, *tid)).map(|x| x.rect)).collect();
+                let at = rects.iter().filter(|x| x.center().x < p.x).count();
+                let x = rects.get(at).map(|x| x.left()).or(rects.last().map(|x| x.right())).unwrap_or(r.left()).clamp(r.left(), r.right());
+                return Some((gid, DropAt::Into(Some(at)), Rect::from_min_max(pos2(x - 1.0, r.top()), pos2(x + 1.0, r.top() + strip_h))));
+            }
+            let (fx, fy) = ((p.x - body.left()) / body.width().max(1.0), (p.y - body.top()) / body.height().max(1.0));
+            let edge = [(fx, false, true), (1.0 - fx, false, false), (fy, true, true), (1.0 - fy, true, false)].into_iter().filter(|e| e.0 < 0.25).min_by(|a, b| a.0.total_cmp(&b.0));
+            let lone = gid == from && self.tabs.groups[g].tabs.len() < 2;
+            match edge.filter(|_| !lone && self.tabs.groups.len() < MAX_GROUPS) {
+                Some((_, down, before)) => {
+                    let c = body.center();
+                    let half = match (down, before) {
+                        (false, true) => body.with_max_x(c.x),
+                        (false, false) => body.with_min_x(c.x),
+                        (true, true) => body.with_max_y(c.y),
+                        (true, false) => body.with_min_y(c.y),
+                    };
+                    Some((gid, DropAt::Side { down, before }, half))
+                }
+                None if gid == from => None,
+                None => Some((gid, DropAt::Into(None), body)),
+            }
+        });
+        if down {
+            let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::unique("tab-drop")));
+            if let Some((_, at, r)) = &target {
+                let strip = matches!(at, DropAt::Into(Some(_)));
+                p.rect_filled(*r, 0.0, if strip { t.ui.accent } else { t.ui.accent.gamma_multiply(0.16) });
+            }
+            if let Some(at) = pos {
+                let g = p.layout_no_wrap(title, t.font_small(), t.ui.text_strong);
+                let chip = Rect::from_min_size(at + vec2(12.0, 14.0), g.size() + vec2(14.0, 6.0));
+                p.rect_filled(chip, 4.0, t.ui.overlay_bg);
+                p.rect_stroke(chip, 4.0, t.border(), egui::StrokeKind::Inside);
+                p.galley(chip.min + vec2(7.0, 3.0), g, t.ui.text_strong);
+            }
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            ui.ctx().request_repaint();
+            return;
+        }
+        self.tab_drag = None;
+        if let Some((to, at, _)) = target {
+            if self.tabs.drop_tab(from, id, to, at) {
+                self.group_changed();
+            }
+        }
+    }
+
+    /// One group: its tab strip (tabs, Markdown preview toggle, split button) and the active tab's body.
+    fn group_ui(&mut self, ui: &mut Ui, gid: u32, rect: Rect, t: &Theme) {
+        let Some(g) = self.tabs.group_index(gid) else { return };
+        let focused = g == self.tabs.cur;
+        self.tabs.primary_for(g);
+        let mut body = rect;
+        if !self.tabs.groups[g].tabs.is_empty() {
+            let sr = Rect::from_min_size(rect.min, vec2(rect.width(), (t.row_h() + 8.0).round()));
+            let file = self.tabs.groups[g].active.and_then(|id| self.tabs.by_id(id)).and_then(|i| self.tabs.list[i].file());
+            let md = file.is_some_and(|f| f.doc().is_some() && f.markdown());
+            let split = file.is_some() && self.tabs.groups.len() < MAX_GROUPS && rect.width() >= 200.0;
+            let mut on = file.and_then(|f| f.preview.as_ref()).is_some_and(|p| p.on);
+            let tools_w = if md { 84.0 } else { 0.0 } + if split { 32.0 } else { 0.0 };
+            let strip_r = sr.with_max_x(sr.right() - tools_w);
+            let act = self.tabs.strip(ui, strip_r, t, g, focused);
+            let mut cmd = None;
+            if tools_w > 0.0 {
+                let tr = Rect::from_min_max(pos2(strip_r.right(), sr.top()), sr.max);
+                ui.painter().rect_filled(tr, 0.0, t.ui.panel_bg);
+                ui.painter().hline(tr.x_range(), tr.bottom() - 0.5, t.border());
+                ui.painter().vline(tr.left() + 0.5, tr.y_range(), t.border());
+                let mut x = tr.left();
+                if md {
+                    let br = Rect::from_center_size(pos2(x + 42.0, tr.center().y), vec2(64.0, (t.row_h() - 2.0).round()));
+                    if widgets::text_toggle(ui, br, "Preview", &mut on, "Markdown preview", t, preview_toggle_id(gid)) {
+                        cmd = Some(Cmd::MdPreview);
+                    }
+                    x += 84.0;
+                }
+                if split {
+                    let br = Rect::from_center_size(pos2(x + 16.0, tr.center().y), vec2(24.0, (t.row_h() - 2.0).round()));
+                    let tip = format!("Split right  {}\nalt+click: split down", commands::shortcut(Cmd::SplitRight, self.mac));
+                    let resp = ui.interact(br, split_button_id(gid), Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip);
+                    if resp.hovered() {
+                        ui.painter().rect_filled(br, 3.0, t.ui.row_hover);
+                    }
+                    widgets::split_icon(ui.painter(), br.center(), if resp.hovered() { t.ui.text_strong } else { t.ui.text_muted });
+                    if resp.clicked() {
+                        // The modifiers of the click itself (the polled ones can lag behind it).
+                        let alt = ui.input(|i| i.modifiers.alt || i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { modifiers, .. } if modifiers.alt)));
+                        cmd = Some(if alt { Cmd::SplitDown } else { Cmd::SplitRight });
+                    }
+                }
+            }
+            match act {
+                Some(StripAction::Activate(id)) => {
+                    self.tabs.activate_in(g, id);
+                    self.group_changed();
+                }
+                Some(StripAction::Close(id)) => self.close_view(gid, id),
+                Some(StripAction::Menu(id, pos)) => self.open_tab_menu(gid, id, pos),
+                Some(StripAction::Drag(id)) => self.tab_drag = Some((gid, id)),
+                None => {}
+            }
+            if let (Some(c), Some(g)) = (cmd, self.tabs.group_index(gid)) {
+                self.tabs.focus_group(g);
+                self.run_cmd(c);
+            }
+            body.min.y = sr.bottom();
+        }
+        // The strip may have closed the group.
+        if let Some(g) = self.tabs.group_index(gid) {
+            self.editor_area(ui, g, gid, body, t);
+        }
     }
 
     /// Thin banner with text buttons; returns the clicked button.
@@ -518,9 +679,11 @@ impl App {
         out
     }
 
-    fn editor_area(&mut self, ui: &mut Ui, rect: Rect, t: &Theme) {
+    /// Body of group `g` (id `gid`): its active tab.
+    fn editor_area(&mut self, ui: &mut Ui, g: usize, gid: u32, rect: Rect, t: &Theme) {
         let mac = self.mac;
-        let Some(ai) = self.tabs.active else {
+        let focused = g == self.tabs.cur;
+        let Some(ai) = self.tabs.groups[g].active.and_then(|id| self.tabs.by_id(id)) else {
             welcome::empty_hints(ui, rect, t, mac);
             return;
         };
@@ -544,6 +707,8 @@ impl App {
             TabKind::File(_) => {}
         }
         let tab_id = self.tabs.list[ai].id;
+        // This group's cursor, scroll and preview state.
+        self.tabs.primary_for(g);
         let code_hints = self.settings.code_hints;
         let mut opts = EditorOptions {
             tab_width: self.settings.tab_width,
@@ -557,7 +722,8 @@ impl App {
             auto_indent: self.settings.auto_indent,
             context_menu: true,
         };
-        let focus = std::mem::take(&mut self.focus_editor);
+        // Only the focused group takes the keyboard.
+        let focus = focused && std::mem::take(&mut self.focus_editor);
         let mut area = rect;
         // Banners.
         let (banner, bad) = match self.tabs.list[ai].file() {
@@ -596,10 +762,10 @@ impl App {
         }
         let pointer = ui.ctx().pointer_hover_pos();
         let mut ratio = self.md_ratio;
-        let mut injected = std::mem::take(&mut self.inject_md);
+        let mut injected = if focused { std::mem::take(&mut self.inject_md) } else { Vec::new() };
         let Some(f) = self.tabs.list[ai].file_mut() else { return };
         if matches!(f.view, View::Text(_)) {
-            opts.request_focus = focus || std::mem::take(&mut f.focus_editor);
+            opts.request_focus = focused && (focus || std::mem::take(&mut f.focus_editor));
         } else if matches!(f.view, View::Loading) {
             // Keep the request until the text arrives.
             f.focus_editor |= focus;
@@ -623,7 +789,7 @@ impl App {
                 pv_r = Some(Rect::from_min_max(pos2(x + 1.0, area.top()), area.max));
                 ui.painter().vline(x + 0.5, area.y_range(), t.border());
                 let hr = Rect::from_min_max(pos2(x - 3.0, area.top()), pos2(x + 4.0, area.bottom()));
-                let h = ui.interact(hr, preview_divider_id(), Sense::drag()).on_hover_cursor(CursorIcon::ResizeHorizontal);
+                let h = ui.interact(hr, preview_divider_id(gid), Sense::drag()).on_hover_cursor(CursorIcon::ResizeHorizontal);
                 if h.dragged() {
                     ratio = ((x + h.drag_delta().x - area.left()) / area.width()).clamp(0.05, 0.95);
                 }
@@ -648,9 +814,11 @@ impl App {
                 }
                 View::Text(doc) => {
                     let lenses: &[margin_editor::Lens] = if code_hints { &hints.lenses } else { &[] };
-                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).id_salt(("editor", tab_id)));
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).id_salt(("editor", gid, tab_id)));
                     child.set_clip_rect(area);
-                    self.editor_id = Some(child.make_persistent_id("margin-editor"));
+                    if focused {
+                        self.editor_id = Some(child.make_persistent_id("margin-editor"));
+                    }
                     result = Some(margin_editor::show(&mut child, doc, st, &opts, t, lenses));
                 }
             }
@@ -665,7 +833,7 @@ impl App {
                 }
                 pv.editor_top = Some(top);
             }
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(pr.shrink2(vec2(0.0, 0.0))).id_salt(("preview", tab_id)));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(pr.shrink2(vec2(0.0, 0.0))).id_salt(("preview", gid, tab_id)));
             child.set_clip_rect(pr);
             match pv.doc.clone() {
                 Some(d) => md_out = Some(margin_md::show(&mut child, &d, &mut pv.state, t)),
@@ -676,6 +844,8 @@ impl App {
         }
         if !injected.is_empty() {
             md_out = Some(injected.remove(0));
+        }
+        if focused {
             self.inject_md = injected;
         }
         self.md_ratio = ratio;
@@ -687,7 +857,9 @@ impl App {
             }
         }
         if let Some(out) = result {
-            self.word_at_cursor = out.word_at_cursor;
+            if focused {
+                self.word_at_cursor = out.word_at_cursor;
+            }
             if let Some((word, _)) = out.goto_definition {
                 self.goto_definition(word);
             }
@@ -708,11 +880,6 @@ impl App {
             if let Some(pos) = o.context_menu {
                 self.open_md_menu(tab_id, pos, o.context_link);
             }
-        }
-        let panel = self.results.is_some() || self.paths.is_some();
-        if panel && ui.input(|i| i.key_pressed(Key::Escape)) && !self.tabs.active_file().is_some_and(|f| f.st.find_open()) {
-            self.results = None;
-            self.paths = None;
         }
     }
 
@@ -892,12 +1059,24 @@ impl App {
     }
 }
 
-pub fn preview_toggle_id() -> Id {
-    Id::unique("md-preview-toggle")
+/// `Preview` toggle in the tab strip of group `group` (the first group is 1).
+pub fn preview_toggle_id(group: u32) -> Id {
+    Id::unique(("md-preview-toggle", group))
 }
 
-pub fn preview_divider_id() -> Id {
-    Id::unique("md-preview-divider")
+/// Editor | preview divider of group `group`.
+pub fn preview_divider_id(group: u32) -> Id {
+    Id::unique(("md-preview-divider", group))
+}
+
+/// Split button in the tab strip of group `group`.
+pub fn split_button_id(group: u32) -> Id {
+    Id::unique(("split-button", group))
+}
+
+/// Divider after child `index` of the layout split at `path` (`[]`: the root split).
+pub fn group_divider_id(path: &[usize], index: usize) -> Id {
+    Id::unique(("group-divider", path, index))
 }
 
 pub fn human_size(n: u64) -> String {

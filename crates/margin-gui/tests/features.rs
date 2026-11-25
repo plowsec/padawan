@@ -498,13 +498,13 @@ fn tree_and_tab_context_menus() {
     let tabs = h.probe().tabs.len();
     assert_eq!(tabs, 2);
     // The active tab id is the last one added; find its strip rect by trying ids.
-    let rect = (1..20u64).filter_map(|id| h.rect_of(margin_gui::tabs::tab_id(id)).map(|r| (id, r))).last().unwrap().1;
+    let rect = (1..20u64).filter_map(|id| h.rect_of(margin_gui::tabs::tab_id(1, id)).map(|r| (id, r))).last().unwrap().1;
     right_click(&mut h, rect.center());
-    assert_eq!(h.probe().ctx_menu, vec!["Close", "Close Others", "Close All", "Copy Path", "Copy Relative Path"]);
+    assert_eq!(h.probe().ctx_menu, vec!["Close", "Close Others", "Close All", "Split Right", "Split Down", "Move to Next Group", "Move to Previous Group", "Copy Path", "Copy Relative Path"]);
     ctx_pick(&mut h, "Close Others");
     assert_eq!(h.probe().tabs, vec!["util.rs"]);
     h.frames(1);
-    let rect = (1..20u64).filter_map(|id| h.rect_of(margin_gui::tabs::tab_id(id)).map(|r| (id, r))).last().unwrap().1;
+    let rect = (1..20u64).filter_map(|id| h.rect_of(margin_gui::tabs::tab_id(1, id)).map(|r| (id, r))).last().unwrap().1;
     right_click(&mut h, rect.center());
     ctx_pick(&mut h, "Close All");
     assert!(h.probe().tabs.is_empty());
@@ -580,7 +580,7 @@ fn md_preview_toggle_links_and_tasks() {
     h.opened();
     open_file(&mut h, "docs/a.md");
     assert!(!h.probe().preview_on, "off by default");
-    click_id(&mut h, margin_gui::preview_toggle_id());
+    click_id(&mut h, margin_gui::preview_toggle_id(1));
     let p = h.until("parsed", |p| p.preview_on && p.preview_parsed);
     assert!(p.preview_on);
     // Task toggle: one edit, undoable.
@@ -621,7 +621,7 @@ fn md_preview_select_copy_and_menu() {
     let mut h = H::new(&files);
     h.opened();
     open_file(&mut h, "a.md");
-    click_id(&mut h, margin_gui::preview_toggle_id());
+    click_id(&mut h, margin_gui::preview_toggle_id(1));
     let p = h.until("drawn", |p| p.preview_parsed && p.preview_text.len() == 3);
     let (first, second) = (p.preview_text[1], p.preview_text[2]);
     let secondary = |h: &mut H, at: egui::Pos2| {

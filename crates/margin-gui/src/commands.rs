@@ -25,6 +25,17 @@ pub enum Cmd {
     CloseTab,
     NextTab,
     PrevTab,
+    /// New editor group right of the focused one, showing the same file.
+    SplitRight,
+    SplitDown,
+    /// Focus group N in layout order; the first missing one is made by a split.
+    FocusGroup1,
+    FocusGroup2,
+    FocusGroup3,
+    FocusNextGroup,
+    FocusPrevGroup,
+    MoveTabRight,
+    MoveTabLeft,
     Undo,
     Redo,
     Cut,
@@ -132,6 +143,15 @@ pub const ALL: &[Def] = &[
     def!(CloseTab, "Close Tab", [c(CMD, K::W)]),
     def!(NextTab, "Next Tab", [c(CTRL, K::Tab)]),
     def!(PrevTab, "Previous Tab", [c(CTRL | SHIFT, K::Tab)]),
+    def!(SplitRight, "Split Editor Right", [c(CMD, K::Backslash)]),
+    def!(SplitDown, "Split Editor Down", [c(CMD | ALT, K::Backslash)]),
+    def!(FocusGroup1, "Focus First Editor Group", [c(CMD, K::Num1)]),
+    def!(FocusGroup2, "Focus Second Editor Group", [c(CMD, K::Num2)]),
+    def!(FocusGroup3, "Focus Third Editor Group", [c(CMD, K::Num3)]),
+    def!(FocusNextGroup, "Focus Next Editor Group", []),
+    def!(FocusPrevGroup, "Focus Previous Editor Group", []),
+    def!(MoveTabRight, "Move Tab to Next Group", [c(CMD | CTRL, K::ArrowRight)], [c(CMD | ALT, K::ArrowRight)]),
+    def!(MoveTabLeft, "Move Tab to Previous Group", [c(CMD | CTRL, K::ArrowLeft)], [c(CMD | ALT, K::ArrowLeft)]),
     pass!(Undo, "Undo", [c(CMD, K::Z)]),
     pass!(Redo, "Redo", [c(CMD | SHIFT, K::Z)], [c(CMD, K::Y), c(CMD | SHIFT, K::Z)]),
     pass!(Cut, "Cut", [c(CMD, K::X)]),
@@ -246,6 +266,9 @@ pub const MENUS: &[(&str, &[MenuItem])] = &[
             M(Cmd::ToggleMenuBar),
             M(Cmd::MdPreview),
             Sep,
+            M(Cmd::SplitRight),
+            M(Cmd::SplitDown),
+            Sep,
             M(Cmd::ToggleWrap),
             M(Cmd::ToggleWhitespace),
             M(Cmd::ToggleLineNumbers),
@@ -274,6 +297,11 @@ pub const MENUS: &[(&str, &[MenuItem])] = &[
             Sep,
             M(Cmd::NextTab),
             M(Cmd::PrevTab),
+            Sep,
+            M(Cmd::FocusNextGroup),
+            M(Cmd::FocusPrevGroup),
+            M(Cmd::MoveTabRight),
+            M(Cmd::MoveTabLeft),
         ],
     ),
     ("Help", &[M(Cmd::Shortcuts), M(Cmd::About)]),
@@ -314,6 +342,10 @@ pub fn label(ch: Chord, mac: bool) -> String {
         K::Minus => "-".to_owned(),
         K::Comma => ",".to_owned(),
         K::Num0 => "0".to_owned(),
+        K::Num1 => "1".to_owned(),
+        K::Num2 => "2".to_owned(),
+        K::Num3 => "3".to_owned(),
+        K::Backslash => "\\".to_owned(),
         K::Slash => "/".to_owned(),
         K::OpenBracket => "[".to_owned(),
         K::CloseBracket => "]".to_owned(),
@@ -444,6 +476,10 @@ mod tests {
         assert_eq!(shortcut(Cmd::CloseFolder, true), "");
         assert_eq!(shortcut(Cmd::ToggleComment, true), "⌘/");
         assert_eq!(shortcut(Cmd::MoveLineUp, false), "Alt+Up");
+        assert_eq!(shortcut(Cmd::SplitRight, true), "⌘\\");
+        assert_eq!(shortcut(Cmd::MoveTabRight, true), "⌃⌘→");
+        assert_eq!(shortcut(Cmd::MoveTabRight, false), "Ctrl+Alt+Right");
+        assert_eq!(shortcut(Cmd::FocusGroup2, false), "Ctrl+2");
     }
 
     #[test]

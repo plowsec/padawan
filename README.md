@@ -44,7 +44,10 @@ Linux needs X11 or Wayland, `libxkbcommon`, a Vulkan or OpenGL driver, glibc 2.3
 | `f12` / cmd+click, `shift+f12` | go to definition, callers |
 | `ctrl+g`, `cmd+shift+o` | go to line, go to function in file |
 | `ctrl+-`, `ctrl+shift+-` | back, forward (`alt+←` / `alt+→` off macOS) |
-| `ctrl+tab`, `ctrl+shift+tab` | next, previous tab |
+| `ctrl+tab`, `ctrl+shift+tab` | next, previous tab (of the focused group) |
+| `cmd+\`, `cmd+alt+\` | split right, split down |
+| `cmd+1` `cmd+2` `cmd+3` | focus group 1–3 (the first missing one: split) |
+| `ctrl+cmd+→` / `ctrl+cmd+←` | move tab to the next / previous group (`ctrl+alt+→` / `←` off macOS) |
 | `alt+↑` / `alt+↓`, `shift+alt+↓`, `cmd+shift+k` | move line, duplicate line, delete line |
 | `cmd+]`, `cmd+[`, `cmd+/` | indent, outdent, toggle comment |
 | `cmd+shift+v` | Markdown preview |
@@ -53,6 +56,22 @@ Linux needs X11 or Wayland, `libxkbcommon`, a Vulkan or OpenGL driver, glibc 2.3
 | `cmd+=` `cmd+-` `cmd+0` | zoom |
 
 Right-click: editor, file tree, tabs, search results.
+
+## Splits
+
+Editor groups side by side or stacked, nested; each has its own tabs. Up to 8.
+
+| Do | How |
+|---|---|
+| Split | `cmd+\`, the button right of the tabs (alt+click: down), tab menu ▸ Split Right / Down, View menu |
+| Same file in two groups | one buffer: edits and saves are shared; cursor, scroll, find bar, Markdown preview per group |
+| Focus a group | click in it, `cmd+1`…`3`, Go ▸ Focus Next / Previous Editor Group |
+| Move a tab | drag it: onto a strip (position), a group's middle (into it), a group's edge (new group there); or `ctrl+cmd+→` / `←` |
+| Resize | drag the line between groups |
+| Close a group | close its last tab |
+| New files open in | the focused group (also when the file is already open in another one) |
+
+Groups, sizes and the focused one are restored with the folder (`state.conf`: `group`, `layout`, `focus`).
 
 ## Search
 

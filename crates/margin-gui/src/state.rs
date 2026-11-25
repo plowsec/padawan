@@ -6,6 +6,8 @@
 //! | `sidebar_width = <pt>` / `sidebar = on/off` | sidebar |
 //! | `folder = <abs path>` | starts a folder block; the `tab` / `active` lines after it belong to it |
 //! | `tab = <rel path>` / `active = <rel path>` | open tabs of that folder, in order |
+//! | `group = <n>` | the `tab` / `active` lines after it belong to the next editor group |
+//! | `layout = r(0:500,d(1:500,2:500):500)` / `focus = <n>` | how the groups are split (`tabs::Node::write`), the focused one |
 //!
 //! Paths with control characters are never written (they would break the line format).
 //! Writes: temp file + rename, on the writer thread; only `settings.conf`, `state.conf` (+ `.tmp`) in an absolute config dir,
@@ -20,6 +22,8 @@ use crate::settings::parse_conf;
 pub const MAX_RECENT: usize = 12;
 const MAX_FOLDERS: usize = 32;
 const MAX_TABS: usize = 64;
+/// Editor groups saved per folder (`tabs::MAX_GROUPS`).
+const MAX_GROUPS: usize = crate::tabs::MAX_GROUPS;
 pub const SIDEBAR_W: std::ops::RangeInclusive<f32> = 160.0..=640.0;
 /// Hot-exit buffers kept on disk at most.
 pub const MAX_UNTITLED: usize = 32;
@@ -27,11 +31,35 @@ pub const MAX_UNTITLED: usize = 32;
 pub const MAX_UNTITLED_BYTES: usize = 4 << 20;
 const UNTITLED_DIR: &str = "untitled";
 
+/// Tabs of one editor group.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GroupTabs {
+    pub tabs: Vec<String>,
+    pub active: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct FolderTabs {
     pub root: String,
+    /// First group.
     pub tabs: Vec<String>,
     pub active: Option<String>,
+    /// The other groups.
+    pub more: Vec<GroupTabs>,
+    /// `tabs::Node::write` over group indices (0 = first group); empty: one group / a row.
+    pub layout: String,
+    /// Index of the focused group.
+    pub focus: usize,
+}
+
+impl FolderTabs {
+    fn count(&self) -> usize {
+        self.tabs.len() + self.more.iter().map(|g| g.tabs.len()).sum::<usize>()
+    }
+}
+
+fn layout_safe(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 512 && s.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'r' | b'd' | b'(' | b')' | b',' | b':'))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -74,18 +102,46 @@ impl SavedState {
                     }
                     cur = line_safe(&v).then(|| FolderTabs { root: v, ..Default::default() });
                 }
+                "group" => {
+                    if let Some(f) = cur.as_mut() {
+                        if f.more.len() + 1 < MAX_GROUPS {
+                            f.more.push(GroupTabs::default());
+                        }
+                    }
+                }
                 "tab" => {
                     if let Some(f) = cur.as_mut() {
-                        if f.tabs.len() < MAX_TABS && margin_proto::RelPath::new(&v).is_ok() && !v.is_empty() && !f.tabs.contains(&v) {
-                            f.tabs.push(v);
+                        let room = f.count() < MAX_TABS;
+                        let tabs = match f.more.last_mut() {
+                            Some(g) => &mut g.tabs,
+                            None => &mut f.tabs,
+                        };
+                        if room && margin_proto::RelPath::new(&v).is_ok() && !v.is_empty() && !tabs.contains(&v) {
+                            tabs.push(v);
                         }
                     }
                 }
                 "active" => {
                     if let Some(f) = cur.as_mut() {
-                        if f.tabs.contains(&v) {
-                            f.active = Some(v);
+                        let (tabs, active) = match f.more.last_mut() {
+                            Some(g) => (&g.tabs, &mut g.active),
+                            None => (&f.tabs, &mut f.active),
+                        };
+                        if tabs.contains(&v) {
+                            *active = Some(v);
                         }
+                    }
+                }
+                "layout" => {
+                    if let Some(f) = cur.as_mut() {
+                        if layout_safe(&v) {
+                            f.layout = v;
+                        }
+                    }
+                }
+                "focus" => {
+                    if let Some(f) = cur.as_mut() {
+                        f.focus = v.parse::<usize>().ok().filter(|n| *n < MAX_GROUPS).unwrap_or(0);
                     }
                 }
                 _ => {}
@@ -97,7 +153,10 @@ impl SavedState {
         s
     }
 
-    fn push_folder(&mut self, f: FolderTabs) {
+    fn push_folder(&mut self, mut f: FolderTabs) {
+        if f.focus > f.more.len() {
+            f.focus = 0;
+        }
         if self.folders.len() < MAX_FOLDERS && !self.folders.iter().any(|g| g.root == f.root) {
             self.folders.push(f);
         }
@@ -111,11 +170,26 @@ impl SavedState {
         }
         for f in self.folders.iter().filter(|f| line_safe(&f.root)).take(MAX_FOLDERS) {
             out += &format!("folder = {}\n", f.root);
-            for t in f.tabs.iter().filter(|t| line_safe(t)).take(MAX_TABS) {
-                out += &format!("tab = {t}\n");
+            let mut left = MAX_TABS;
+            let mut group = |out: &mut String, tabs: &[String], active: &Option<String>| {
+                for t in tabs.iter().filter(|t| line_safe(t)).take(left) {
+                    *out += &format!("tab = {t}\n");
+                    left -= 1;
+                }
+                if let Some(a) = active.as_ref().filter(|a| line_safe(a)) {
+                    *out += &format!("active = {a}\n");
+                }
+            };
+            group(&mut out, &f.tabs, &f.active);
+            for (i, g) in f.more.iter().take(MAX_GROUPS - 1).enumerate() {
+                out += &format!("group = {}\n", i + 1);
+                group(&mut out, &g.tabs, &g.active);
             }
-            if let Some(a) = f.active.as_ref().filter(|a| line_safe(a)) {
-                out += &format!("active = {a}\n");
+            if layout_safe(&f.layout) {
+                out += &format!("layout = {}\n", f.layout);
+            }
+            if f.focus > 0 {
+                out += &format!("focus = {}\n", f.focus);
             }
         }
         out
@@ -315,9 +389,15 @@ mod tests {
         s.touch_recent("/b c");
         s.touch_recent("/a");
         assert_eq!(s.recent, vec!["/a", "/b c"]);
-        s.set_tabs(FolderTabs { root: "/a".into(), tabs: vec!["x.rs".into(), "d/y.md".into()], active: Some("d/y.md".into()) });
-        s.set_tabs(FolderTabs { root: "/b c".into(), tabs: vec![], active: None });
+        s.set_tabs(FolderTabs { root: "/a".into(), tabs: vec!["x.rs".into(), "d/y.md".into()], active: Some("d/y.md".into()), ..Default::default() });
+        s.set_tabs(FolderTabs { root: "/b c".into(), ..Default::default() });
         assert_eq!(SavedState::parse(&s.write()), s);
+        // Groups: the same file may sit in two of them.
+        let g = |tabs: &[&str], active: &str| GroupTabs { tabs: tabs.iter().map(|t| (*t).to_owned()).collect(), active: Some(active.to_owned()) };
+        s.set_tabs(FolderTabs { root: "/g".into(), tabs: vec!["x.rs".into()], active: Some("x.rs".into()), more: vec![g(&["x.rs", "z.c"], "z.c"), GroupTabs::default()], layout: "r(0:600,d(1:500,2:500):400)".into(), focus: 1 });
+        let text = s.write();
+        assert!(text.contains("group = 1\ntab = x.rs\ntab = z.c\nactive = z.c\ngroup = 2\nlayout = r(0:600,d(1:500,2:500):400)\nfocus = 1\n"), "{text}");
+        assert_eq!(SavedState::parse(&text), s);
         for i in 0..20 {
             s.touch_recent(&format!("/r{i}"));
         }
@@ -333,6 +413,20 @@ mod tests {
         assert_eq!(s.folders[0].active, None);
         assert!(s.recent.is_empty());
         assert_eq!(s.sidebar_width, 640.0);
+        // Groups: capped, a bad layout or focus is dropped, tabs are capped over all groups.
+        let mut text = String::from("folder = /g\nlayout = r(0:1,$(1:1))\nfocus = 99\ntab = a\n");
+        for i in 0..20 {
+            text += &format!("group = x\ntab = a\ntab = t{i}\nactive = nope\n");
+        }
+        for i in 0..100 {
+            text += &format!("tab = u{i}\n");
+        }
+        let s = SavedState::parse(&text);
+        let f = &s.folders[0];
+        assert_eq!((f.more.len(), f.layout.as_str(), f.focus), (MAX_GROUPS - 1, "", 0));
+        assert_eq!(f.more[0].tabs, vec!["a", "t0"]);
+        assert_eq!(f.count(), MAX_TABS);
+        assert_eq!(SavedState::parse("folder = /g\ntab = a\nfocus = 3\n").folders[0].focus, 0, "no such group");
         let mut w = SavedState::default();
         w.touch_recent("/evil\nrecent = /x");
         assert!(w.recent.is_empty());
