@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use common::{Script, H};
 use egui::{Event, Key, Modifiers, PointerButton, Pos2};
+use margin_gui::hints::{SEG_CALLERS, SEG_SINKS};
 use margin_proto::{CallPath, FlowArg, Hop, RelPath, Site};
 
 const PARSER_C: &str = r#"/* Tiny HTTP header parser. */
@@ -247,9 +248,8 @@ fn shots(out: &Path, mode: &str, suffix: &str, scale: f32, size: [f32; 2], setti
     a.until("sinks hint", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks"))));
     a.frames(5);
     let p = a.probe();
-    let (line, segs) = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).cloned().unwrap();
-    let k = segs.iter().position(|s| s.starts_with("sinks")).unwrap();
-    a.click_id(p.editor_id.unwrap().with(("lens", line, k)));
+    let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).unwrap().0;
+    a.click_id(p.editor_id.unwrap().with(("lens", line, SEG_SINKS)));
     a.until("paths", |p| p.paths == 3);
     a.key(Key::ArrowDown, Modifiers::NONE);
     a.frames(3);
@@ -323,7 +323,7 @@ impl Drive for H {
         let p = self.probe();
         let id = p.editor_id.expect("editor");
         let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.contains("caller"))).map(|l| l.0).expect("a callers hint");
-        let r = self.rect_of(id.with(("lens", line, 0usize))).expect("lens rect");
+        let r = self.rect_of(id.with(("lens", line, SEG_CALLERS))).expect("lens rect");
         self.click(r.center());
     }
 }

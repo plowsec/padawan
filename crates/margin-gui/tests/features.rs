@@ -8,6 +8,7 @@ use std::sync::Arc;
 use common::{sample_files, Script, H};
 use egui::{Event, Key, Modifiers, PointerButton, Pos2};
 use margin_editor::EditAction;
+use margin_gui::hints::{SEG_CALLERS, SEG_SINKS};
 use margin_gui::{menubar, search_panel, side};
 use margin_md::PreviewOutput;
 use margin_proto::{CallPath, FileMatch, FlowArg, Hop, RelPath, Request, Site};
@@ -535,11 +536,10 @@ fn paths_view_renders_navigates_and_opens_hops() {
     h.opened();
     open_file(&mut h, "src/main.c");
     let p = h.until("lenses", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks"))));
-    let (line, segs) = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).cloned().unwrap();
-    let k = segs.iter().position(|s| s.starts_with("sinks")).unwrap();
+    let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).unwrap().0;
     h.frames(2);
     let id = h.probe().editor_id.unwrap();
-    click_id(&mut h, id.with(("lens", line, k)));
+    click_id(&mut h, id.with(("lens", line, SEG_SINKS)));
     let p = h.until("paths", |p| p.paths == 3);
     assert_eq!(p.paths_title.as_deref(), Some("Paths from parse_header to sinks · 3"));
     assert_eq!(p.paths_selected.as_deref(), Some("src/main.c:5"));
@@ -556,7 +556,7 @@ fn paths_view_renders_navigates_and_opens_hops() {
     click_id(&mut h, margin_gui::paths_view::panel_id().with(("row", 0usize)));
     h.frames(1);
     // Callers segment still opens the plain results list.
-    click_id(&mut h, id.with(("lens", line, 0usize)));
+    click_id(&mut h, id.with(("lens", line, SEG_CALLERS)));
     let p = h.until("callers", |p| p.results_title.is_some());
     assert!(p.paths_title.is_none());
 }
@@ -761,11 +761,10 @@ fn hostile_paths_names_and_args_do_not_panic() {
     h.app.probe();
     // Ask for paths directly through the lens.
     let p = h.probe();
-    let (line, segs) = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).cloned().unwrap();
-    let k = segs.iter().position(|s| s.starts_with("sinks")).unwrap();
+    let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).unwrap().0;
     h.frames(2);
     let id = h.probe().editor_id.unwrap();
-    click_id(&mut h, id.with(("lens", line, k)));
+    click_id(&mut h, id.with(("lens", line, SEG_SINKS)));
     let p = h.until("paths", |p| p.paths == 3);
     let t = p.paths_title.unwrap();
     assert!(!t.contains('\u{202e}'));
@@ -852,11 +851,10 @@ fn frame_time_paths_view_500_paths() {
     h.opened();
     open_file(&mut h, "src/main.c");
     let p = h.until("lenses", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks"))));
-    let (line, segs) = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).cloned().unwrap();
-    let k = segs.iter().position(|s| s.starts_with("sinks")).unwrap();
+    let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).unwrap().0;
     h.frames(2);
     let id = h.probe().editor_id.unwrap();
-    click_id(&mut h, id.with(("lens", line, k)));
+    click_id(&mut h, id.with(("lens", line, SEG_SINKS)));
     h.until("500 paths", |p| p.paths == 500);
     let steady = timed(&mut h, 20);
     let mut worst = std::time::Duration::ZERO;

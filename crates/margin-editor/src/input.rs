@@ -457,7 +457,8 @@ pub fn lens_widgets(ui: &mut egui::Ui, cx: &mut Cx<'_, '_>, vis: &[Vis], text: R
             if !r.is_positive() {
                 continue;
             }
-            let mut resp = ui.interact(r, id.with(("lens", v.view.line, s.idx)), Sense::click());
+            // Keyed by the segment id, not its position: segments arrive at different times and shift the ones after them.
+            let mut resp = ui.interact(r, id.with(("lens", v.view.line, s.id)), Sense::click());
             if resp.hovered() {
                 hover = Some((v.view.line, s.idx));
                 resp = resp.on_hover_cursor(CursorIcon::PointingHand);

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use common::{sample_files, Script, H};
 use egui::{Event, Id, Key, Modifiers};
+use margin_gui::hints::{SEG_CALLERS, SEG_SINKS};
 use margin_proto::{DirEntry, EntryKind, FileMatch, RelPath, Request, Site};
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -256,7 +257,7 @@ fn hints_appear_and_callers_open_results() {
     assert!(segs.iter().any(|s| s == "sinks: memcpy"), "{segs:?}");
     h.frames(2);
     let id = h.probe().editor_id.unwrap();
-    let r = h.rect_of(id.with(("lens", line, 0usize))).expect("lens segment");
+    let r = h.rect_of(id.with(("lens", line, SEG_CALLERS))).expect("lens segment");
     h.click(r.center());
     let p = h.until("callers panel", |p| p.results == 2);
     assert!(p.results_title.unwrap().starts_with("Callers of parse_header"));
@@ -264,8 +265,7 @@ fn hints_appear_and_callers_open_results() {
     h.key(Key::Escape, Modifiers::NONE);
     assert!(h.probe().results_title.is_none());
     // Sinks segment: call paths to sinks (bottom paths view).
-    let segs_n = segs.iter().position(|s| s.starts_with("sinks")).unwrap();
-    let r = h.rect_of(id.with(("lens", line, segs_n))).expect("sinks segment");
+    let r = h.rect_of(id.with(("lens", line, SEG_SINKS))).expect("sinks segment");
     h.click(r.center());
     let p = h.until("paths panel", |p| p.paths_title.as_deref().is_some_and(|t| !t.ends_with('…')));
     assert_eq!(p.paths_title.as_deref(), Some("Paths from parse_header to sinks · 0"));
@@ -345,9 +345,9 @@ fn picker_browses_and_opens() {
     h.key(Key::Enter, Modifiers::NONE);
     h.frames(3);
     h.key(Key::Enter, CMD);
-    let p = h.until("opened", |p| p.folder.is_some());
+    // The picker closes when the engine answers, a frame or more after the folder is set.
+    let p = h.until("opened", |p| p.folder.is_some() && !p.picker_open);
     assert_eq!(p.folder.as_deref(), Some("dev"));
-    assert!(!p.picker_open);
     assert_eq!(p.recent.first().map(String::as_str), Some("/home/me/dev"));
 }
 
