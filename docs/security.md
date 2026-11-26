@@ -5,14 +5,14 @@ An opened folder is hostile: names, contents, symlinks, special files, `.gitigno
 ## Processes
 
 ```
-launcher (no sandbox, reads no file content)
+launcher (no sandbox, parses no file content)
  ├─ gui     Seatbelt: no network, no exec, no user files
  └─ worker  Seatbelt deny-default: the folder + its cache dir     (one per open folder)
 ```
 
 | Process | Network | Exec / fork | Reads | Writes |
 |---|---|---|---|---|
-| launcher | not used | starts the two others; another launcher for "New Window" (rate-limited) | directory names (folder picker) | creates config + cache dirs |
+| launcher | not used | starts the two others; another launcher for "New Window" (rate-limited) | directory names (folder picker) | creates config + cache dirs; one file per "save without a folder" (below) |
 | gui | denied | denied | system files, own binary, `~/.config/margin` | `~/.config/margin`, per-user temp (Metal shader cache) |
 | worker | denied | denied | system libraries, own binary, the folder, its cache dir | the folder, its cache dir |
 
@@ -34,6 +34,18 @@ Then run `target/debug/examples/sandbox_probe` under `sandbox-exec` with a profi
 `/`, the home directory or anything above it, `~/Library`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config`, `~/.local`, `~/.cargo`, `~/.rustup`, `~/.claude`, Margin's own config and cache dirs. Symlinks are resolved first (`sandbox::check_root`).
 
 Why: the worker can write in the folder; a write there would mean code execution or stolen credentials later.
+
+## Saving without a folder
+
+No folder, no worker, and the GUI cannot write user files: the launcher writes the buffer (`apps/margin/src/save.rs`). The bytes are written, never parsed. The request comes from the GUI, so the path is checked there:
+
+| Rule | Why |
+|---|---|
+| absolute path or `~/…`; the parent folder must exist | nothing is guessed or created on the way |
+| not under the folders listed above (`~/.ssh`, `~/.config`, `~/Library`, …), not under Margin's own dirs | credentials, start-up items |
+| no dot-file directly in the home directory | `.zshrc`, `.profile`, `.gitconfig` |
+| new files only (`O_EXCL`); a file is replaced only if this launcher wrote it | nothing that exists is overwritten |
+| not executable, never through a symlink | no hook, no redirect |
 
 ## What never happens
 
@@ -67,7 +79,7 @@ Why: the worker can write in the folder; a write there would mean code execution
 |---|---|
 | Launcher is not sandboxed | it parses only frames from the GUI and its own arguments |
 | Check-then-open race in the jail | no `openat` without `unsafe`; the worker sandbox is the backstop |
-| GUI compromise + launcher | a subverted GUI could ask for a worker on any folder the policy above allows, and for new windows (at most one per 400 ms) |
+| GUI compromise + launcher | a subverted GUI could ask for a worker on any folder the policy above allows, for new windows (at most one per 400 ms), and for new non-executable files wherever "Saving without a folder" allows |
 | Clipboard | the GUI can read and write it (copy/paste); a subverted GUI could too |
 | Untitled notes | stored as plain text in `~/.config/margin/untitled/` |
 | Renderer | text shaping (egui) and Metal (wgpu) run in the GUI process on hostile text |

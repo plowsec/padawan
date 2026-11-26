@@ -99,6 +99,9 @@ Replace (search tab): `Replace All` or per file. Regex: `$1`, `${name}`. Files a
 |---|---|
 | Quick note | `cmd+n`. Kept in `~/.config/margin/untitled/` until saved or discarded; restored at start |
 | Save it | `cmd+s` asks for a path in the open folder |
+| Save it with no folder open | `cmd+s` asks for an absolute path or `~/…`. New files only; the parent folder must exist. `cmd+s` again writes the same file |
+| Not allowed there | `~/.ssh`, `~/.config`, `~/Library` and the like, dot-files directly in `~` (`docs/security.md`) |
+| Edit that file in a later session | open its folder: `margin /abs/file.md` |
 | Preview | `cmd+shift+v`: editor left, rendered right, live |
 | Links in the preview | `#heading` and files of the folder open; URLs are copied, never opened |
 | Copy from the preview | drag to select (double click: word, triple: block, shift+click: extend), `cmd+a`, `cmd+c`, right-click menu. Lists keep their markers, table cells are tab-separated |
@@ -163,6 +166,7 @@ scripts/sign.sh                                                # macOS: codesign
 MARGIN_SMOKE=1 target/debug/margin /abs/folder                 # start, index, print `smoke: ok …`, exit
 MARGIN_SMOKE=clipboard target/debug/margin /abs/folder         # same + copy/paste round trip (overwrites the clipboard)
 MARGIN_SMOKE=newwindow target/debug/margin /abs/folder         # same + a second window
+MARGIN_SMOKE=save MARGIN_SMOKE_SAVE=/abs/new.txt target/debug/margin /abs/folder   # same + a buffer saved outside the folder (`save=ok`)
 git tag vX.Y.Z && git push origin main vX.Y.Z                  # release: CI builds all platforms and publishes (.github/workflows/build.yml)
 scripts/third-party.py <target-triple>                         # crates in the binary + licence texts (shipped as THIRD-PARTY.txt)
 ```

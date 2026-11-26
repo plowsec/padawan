@@ -35,6 +35,14 @@ fn click_id(h: &mut H, id: egui::Id) {
     h.click(r.center());
 }
 
+/// Line of the hint with a `sinks` segment, once the engine's caller count is in: that segment comes later
+/// and moves the others to the right.
+fn sinks_hint(h: &mut H) -> u32 {
+    let full = |l: &(u32, Vec<String>)| l.1.iter().any(|s| s.starts_with("sinks")) && l.1.iter().any(|s| s.ends_with("callers"));
+    let p = h.until("hints with engine numbers", |p| p.lenses.iter().any(full));
+    p.lenses.iter().find(|l| full(l)).unwrap().0
+}
+
 fn click_button(h: &mut H, label: &str) {
     let p = h.until("modal buttons", |p| !p.modal_buttons.is_empty());
     let r = p.modal_buttons.iter().find(|b| b.0 == label).unwrap_or_else(|| panic!("no button {label}: {:?}", p.modal_buttons)).1;
@@ -370,6 +378,90 @@ fn save_as_creates_dirs_writes_create_new_and_unlinks_hot_file() {
 }
 
 #[test]
+fn save_without_a_folder_writes_where_asked() {
+    let mut h = H::with(&sample_files(), Script::default(), None);
+    h.key(Key::N, CMD);
+    h.frames(1);
+    h.type_text("# Idea");
+    h.frames(75);
+    h.app.flush_config();
+    let hot = h.cfg.path().join("untitled/untitled-1.txt");
+    assert!(hot.exists());
+    h.key(Key::S, CMD);
+    let p = h.until("dialog", |p| p.modal.as_deref() == Some("save-as") && !p.modal_buttons.is_empty());
+    let labels: Vec<&str> = p.modal_buttons.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(labels, vec!["Save", "Open Folder…", "Cancel"]);
+    assert_eq!(p.save_as_text.as_deref(), Some("~/"));
+    h.frames(1);
+    // Not absolute: live error, Enter sends nothing.
+    for bad in ["notes/idea.md", "~/notes/"] {
+        h.key(Key::A, CMD);
+        h.type_text(bad);
+        h.key(Key::Enter, NONE);
+        h.frames(2);
+        let p = h.probe();
+        assert_eq!(p.modal.as_deref(), Some("save-as"), "{bad}");
+        assert!(p.save_as_error.is_none() && h.fake.saved.lock().unwrap().is_empty(), "{bad}");
+    }
+    // Refused outside the window process: its message, the dialog stays.
+    h.key(Key::A, CMD);
+    h.type_text("~/.ssh/idea.md");
+    h.key(Key::Enter, NONE);
+    let p = h.until("refused", |p| p.save_as_error.is_some());
+    assert!(p.save_as_error.unwrap().starts_with("refusing to write"));
+    h.key(Key::A, CMD);
+    h.type_text("~/notes/theirs.md");
+    h.key(Key::Enter, NONE);
+    let p = h.until("exists", |p| p.save_as_error.is_some());
+    assert_eq!(p.save_as_error.as_deref(), Some("theirs.md already exists"));
+    assert!(h.fake.saved.lock().unwrap().is_empty());
+
+    h.key(Key::A, CMD);
+    h.type_text("~/notes/idea.md");
+    h.key(Key::Enter, NONE);
+    let p = h.until("saved", |p| p.modal.is_none() && p.active.as_deref() == Some("idea.md"));
+    assert!(!p.active_dirty && p.folder.is_none());
+    assert_eq!(p.active_external.as_deref(), Some("/home/me/notes/idea.md"));
+    assert_eq!(p.tabs, ["idea.md"]);
+    assert_eq!(*h.fake.saved.lock().unwrap(), vec![("/home/me/notes/idea.md".to_owned(), b"# Idea".to_vec(), false)]);
+    h.app.flush_config();
+    assert!(!hot.exists(), "on disk now: no copy in the config dir");
+
+    // Edit, cmd+S: the same file again, no dialog.
+    h.frames(2);
+    h.type_text("!");
+    h.until("dirty", |p| p.active_dirty);
+    h.key(Key::S, CMD);
+    let p = h.until("saved again", |p| !p.active_dirty);
+    assert!(p.modal.is_none());
+    assert_eq!(h.fake.saved.lock().unwrap().last().unwrap(), &("/home/me/notes/idea.md".to_owned(), b"# Idea!".to_vec(), true));
+
+    // Save As: starts from its path; another name makes another file.
+    h.key(Key::S, cs());
+    let p = h.until("dialog", |p| p.modal.as_deref() == Some("save-as") && !p.modal_buttons.is_empty());
+    assert_eq!(p.save_as_text.as_deref(), Some("/home/me/notes/idea.md"));
+    h.frames(2);
+    h.key(Key::A, CMD);
+    h.type_text("/home/me/notes/idea2.md");
+    h.key(Key::Enter, NONE);
+    let p = h.until("saved as", |p| p.modal.is_none() && p.active.as_deref() == Some("idea2.md"));
+    assert_eq!(p.active_external.as_deref(), Some("/home/me/notes/idea2.md"));
+
+    // Closing it with edits: asks like a file, Save writes it and closes.
+    h.frames(2);
+    h.type_text("?");
+    h.until("dirty", |p| p.active_dirty);
+    h.key(Key::W, CMD);
+    let p = h.until("ask", |p| !p.modal_buttons.is_empty());
+    let labels: Vec<&str> = p.modal_buttons.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(labels, vec!["Save", "Don't Save", "Cancel"]);
+    assert_eq!(p.modal_title.as_deref(), Some("Save changes to idea2.md?"));
+    click_button(&mut h, "Save");
+    h.until("closed", |p| p.tabs.is_empty() && p.modal.is_none());
+    assert_eq!(h.fake.saved.lock().unwrap().last().unwrap(), &("/home/me/notes/idea2.md".to_owned(), b"# Idea!?".to_vec(), true));
+}
+
+#[test]
 fn closing_untitled_with_text_asks_and_discard_unlinks() {
     let mut h = H::new(&sample_files());
     h.opened();
@@ -535,8 +627,7 @@ fn paths_view_renders_navigates_and_opens_hops() {
     let mut h = H::with(&sample_files(), paths_script(3), Some(common::ROOT));
     h.opened();
     open_file(&mut h, "src/main.c");
-    let p = h.until("lenses", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks"))));
-    let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).unwrap().0;
+    let line = sinks_hint(&mut h);
     h.frames(2);
     let id = h.probe().editor_id.unwrap();
     click_id(&mut h, id.with(("lens", line, SEG_SINKS)));
@@ -850,8 +941,7 @@ fn frame_time_paths_view_500_paths() {
     let mut h = H::with(&sample_files(), paths_script(500), Some(common::ROOT));
     h.opened();
     open_file(&mut h, "src/main.c");
-    let p = h.until("lenses", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks"))));
-    let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).unwrap().0;
+    let line = sinks_hint(&mut h);
     h.frames(2);
     let id = h.probe().editor_id.unwrap();
     click_id(&mut h, id.with(("lens", line, SEG_SINKS)));

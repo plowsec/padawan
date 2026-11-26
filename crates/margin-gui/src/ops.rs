@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use egui::{pos2, vec2, Id, Key, Order, Rect, Sense};
 use margin_code::Lang;
 use margin_editor::{Document, EditAction, Wrap};
-use margin_proto::limits::MAX_SNIPPET;
+use margin_proto::limits::{MAX_PATH, MAX_SNIPPET};
 use margin_proto::{ErrCode, Event, IndexPhase, Out, RelPath, Reply, Request, SearchQuery, Site};
 
 use crate::app::{waker, AfterSave, App, DocDone, Loc, Modal, Then, BIG_DOC, REINDEX_EVERY};
@@ -72,6 +72,9 @@ impl App {
             if let Some(p) = self.picker.as_mut() {
                 p.set_listing(l);
             }
+        }
+        while let Some(s) = self.opener.poll_saved() {
+            self.on_saved_out(s);
         }
         while let Ok(d) = self.doc_rx.try_recv() {
             self.apply_doc(d);
@@ -601,7 +604,15 @@ impl App {
     pub(crate) fn save_tab(&mut self, id: u64, overwrite: bool) {
         let Some(f) = self.tabs.file_by_id(id) else { return };
         if f.is_untitled() {
-            self.ask_save_as(id, None);
+            match f.external.clone() {
+                // Saved outside a folder before: the same file again.
+                Some(path) => {
+                    if let Err(e) = self.save_out(id, &path, true, false) {
+                        self.toasts.error(&format!("Not saved: {e}"));
+                    }
+                }
+                None => self.ask_save_as(id, None),
+            }
             return;
         }
         let View::Text(doc) = &f.view else { return };
@@ -1413,7 +1424,7 @@ impl App {
         let (title, body, buttons, enter_pick): (String, String, Vec<&str>, Option<usize>) = match &m {
             Modal::Unsaved { tabs, then } => {
                 let names: Vec<String> = tabs.iter().filter_map(|id| self.tabs.by_id(*id)).map(|i| self.tabs.list[i].title()).collect();
-                let untitled = tabs.len() == 1 && tabs.iter().any(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().is_some_and(FileTab::is_untitled)));
+                let untitled = tabs.len() == 1 && tabs.iter().any(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().is_some_and(FileTab::unsaved_buffer)));
                 let title = if names.len() == 1 { format!("Save changes to {}?", names[0]) } else { format!("Save changes to {} files?", names.len()) };
                 let what = match then {
                     Then::Quit => "before quitting",
@@ -1443,7 +1454,7 @@ impl App {
                 // Enter does not confirm: Cancel is the default.
                 (title, "Files on disk are rewritten. This cannot be undone.".to_owned(), vec!["Replace", "Cancel"], Some(1))
             }
-            Modal::SaveAs(_) if self.ws.is_none() => ("Save As".to_owned(), "No folder is open. Open a folder to save into it.".to_owned(), vec!["Open Folder…", "Cancel"], Some(0)),
+            Modal::SaveAs(_) if self.ws.is_none() => ("Save As".to_owned(), "No folder is open: absolute path, or ~/… New files only.".to_owned(), vec!["Save", "Open Folder…", "Cancel"], Some(0)),
             Modal::SaveAs(_) => ("Save As".to_owned(), "Path inside the folder.".to_owned(), vec!["Save", "Cancel"], Some(0)),
             Modal::About => {
                 let body = format!("Version {}\nWindow sandbox: {}\nEngine sandbox: {}", env!("CARGO_PKG_VERSION"), sanitize(&self.gui_sandbox, 40), sanitize(self.opener.sandbox(), 40));
@@ -1451,9 +1462,11 @@ impl App {
             }
         };
         let save_as = match &m {
-            Modal::SaveAs(s) if self.ws.is_some() => Some(s.clone()),
+            Modal::SaveAs(s) => Some(s.clone()),
             _ => None,
         };
+        // No folder: the path is absolute and the opener writes the file.
+        let outside = self.ws.is_none();
         let screen = ctx.content_rect();
         egui::Area::new(Id::unique("modal-scrim")).order(Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
             ui.painter().rect_filled(screen, 0.0, t.ui.scrim);
@@ -1488,7 +1501,7 @@ impl App {
             p.galley(pos2(rect.left() + 24.0, by), body_g, t.ui.text_muted);
             if let Some(sa) = &save_as {
                 let fr = Rect::from_min_size(pos2(rect.left() + 24.0, by + bg_h + 10.0), vec2(w - 48.0, t.row_h() + 6.0));
-                let resp = widgets::field(ui, fr, save_as_id(), &mut text, "notes/idea.md", &t, t.font_mono_ui());
+                let resp = widgets::field(ui, fr, save_as_id(), &mut text, if outside { "~/notes/idea.md" } else { "notes/idea.md" }, &t, t.font_mono_ui());
                 if want_focus {
                     resp.request_focus();
                     widgets::cursor_to_end(ctx, save_as_id(), &text);
@@ -1497,7 +1510,8 @@ impl App {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     field_enter = true;
                 }
-                live_error = save_as_check(&text).err().or_else(|| if text == sa.text { sa.error.clone() } else { None });
+                let check = if outside { save_out_check(&text).err() } else { save_as_check(&text).err() };
+                live_error = check.or_else(|| if text == sa.text { sa.error.clone() } else { None });
                 let er = Rect::from_min_size(pos2(fr.left(), fr.bottom() + 6.0), vec2(fr.width(), t.row_h()));
                 if let Some(e) = &live_error {
                     widgets::text_at(ui, er, er.left(), e, t.font_small(), t.ui.error);
@@ -1529,14 +1543,18 @@ impl App {
         let Some(pick) = pick else { return };
         match m {
             Modal::SaveAs(sa) => {
-                if pick != 0 {
+                if pick == buttons.len() - 1 {
                     self.modal = None;
                     self.focus_editor = true;
-                } else if self.ws.is_none() {
+                } else if pick != 0 {
                     self.modal = None;
                     self.run_cmd(Cmd::OpenFolder);
                 } else if !busy && live_error.is_none() {
-                    self.save_as_submit(sa.tab);
+                    if outside {
+                        self.save_out_submit(sa.tab);
+                    } else {
+                        self.save_as_submit(sa.tab);
+                    }
                 }
                 return;
             }
@@ -1545,7 +1563,7 @@ impl App {
             }
             Modal::Unsaved { tabs, then } => {
                 self.modal = None;
-                let untitled = tabs.len() == 1 && tabs.iter().any(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().is_some_and(FileTab::is_untitled)));
+                let untitled = tabs.len() == 1 && tabs.iter().any(|id| self.tabs.list.iter().any(|t| t.id == *id && t.file().is_some_and(FileTab::unsaved_buffer)));
                 match pick {
                     0 if untitled => {
                         if let Some(id) = tabs.first() {
@@ -1607,6 +1625,24 @@ pub fn save_as_check(text: &str) -> Result<RelPath, String> {
         Ok(p) if !p.is_root() => Ok(p),
         _ => Err("Not a path inside the folder".to_owned()),
     }
+}
+
+/// Path typed in Save As while no folder is open: absolute, or `~/…`. The opener checks where it may go.
+pub fn save_out_check(text: &str) -> Result<String, String> {
+    let s = text.trim();
+    if s.is_empty() || s == "~/" {
+        return Err("Type a path, e.g. ~/notes/idea.md".to_owned());
+    }
+    if s.len() > MAX_PATH || s.chars().any(char::is_control) {
+        return Err("Not a usable path".to_owned());
+    }
+    if !s.starts_with("~/") && !std::path::Path::new(s).is_absolute() {
+        return Err("Absolute path, or ~/…".to_owned());
+    }
+    if s.ends_with(['/', std::path::MAIN_SEPARATOR]) {
+        return Err("That is a folder: add a file name".to_owned());
+    }
+    Ok(s.to_owned())
 }
 
 /// 0-based group of a `FocusGroupN` command.

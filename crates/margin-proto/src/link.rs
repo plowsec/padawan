@@ -95,8 +95,19 @@ pub struct DirListing {
     pub error: String,
 }
 
-/// What the GUI needs from outside its sandbox: engines for folders, and directory names for the folder picker.
-/// Nothing here may block the UI thread.
+/// Answer to `Opener::save`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SavedFile {
+    /// The `id` of the request.
+    pub id: u32,
+    /// Absolute, canonical. Empty on failure.
+    pub path: String,
+    /// Why it failed, for the user; empty on success.
+    pub error: String,
+}
+
+/// What the GUI needs from outside its sandbox: engines for folders, directory names for the folder picker,
+/// and a file written when no folder is open. Nothing here may block the UI thread.
 pub trait Opener: Send {
     /// Start an engine on `root` and return the GUI end. Failures arrive as `Event::Fatal`.
     /// The previous engine of this opener is stopped.
@@ -106,6 +117,12 @@ pub trait Opener: Send {
     /// Ask for the sub-directories of `path` (`None`: the home directory). The answer comes through `poll_browse`.
     fn browse(&mut self, path: Option<&Path>, waker: Waker);
     fn poll_browse(&mut self) -> Option<DirListing>;
+    /// Write `data` to `path` (absolute, or `~/…`): a buffer that belongs to no folder. Existing files are refused;
+    /// `replace`: this opener wrote that file before, write it again. The answer comes through `poll_saved`.
+    fn save(&mut self, _id: u32, _path: &str, _data: Vec<u8>, _replace: bool, _waker: Waker) {}
+    fn poll_saved(&mut self) -> Option<SavedFile> {
+        None
+    }
     /// Open another window, on `folder` if given. Fire and forget; the default does nothing.
     fn new_window(&mut self, _folder: Option<&Path>) {}
 }

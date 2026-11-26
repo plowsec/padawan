@@ -75,6 +75,8 @@ pub struct Probe {
     pub preview_selection: String,
     pub edit_log: Vec<EditAction>,
     pub active_untitled: Option<u32>,
+    /// Absolute path of a buffer saved outside any folder.
+    pub active_external: Option<String>,
     pub menu_bar: bool,
     /// Open modal: title, buttons (label, rect).
     pub modal_title: Option<String>,
@@ -184,6 +186,7 @@ impl App {
             preview_selection: f.and_then(|f| f.preview.as_ref()).and_then(|p| p.doc.as_ref().map(|d| p.state.selected_text(d))).unwrap_or_default(),
             edit_log: self.edit_log.clone(),
             active_untitled: f.and_then(|f| f.untitled),
+            active_external: f.and_then(|f| f.external.clone()),
             menu_bar: self.settings.menu_bar,
             modal_title: self.modal.as_ref().map(|_| self.modal_seen.0.clone()),
             modal_buttons: if self.modal.is_some() { self.modal_seen.1.clone() } else { Vec::new() },

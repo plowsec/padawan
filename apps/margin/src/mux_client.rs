@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use margin_proto::frame::{read_frame, write_frame};
 use margin_proto::mux::{FromLauncher, ToLauncher, MAX_MUX_FRAME};
-use margin_proto::{decode_out, encode_request, Client, DirListing, Event, IndexOpts, Opener, Out, ReqId, Request, Waker};
+use margin_proto::{decode_out, encode_request, Client, DirListing, Event, IndexOpts, Opener, Out, ReqId, Request, SavedFile, Waker};
 
 use crate::args::Args;
 
@@ -30,12 +30,14 @@ struct Route {
     out: Option<Sender<Out>>,
     waker: Option<Waker>,
     browse_waker: Option<Waker>,
+    save_waker: Option<Waker>,
 }
 
 pub struct MuxOpener {
     to_launcher: Sender<ToLauncher>,
     route: Arc<Mutex<Route>>,
     browse_rx: Receiver<DirListing>,
+    saved_rx: Receiver<SavedFile>,
     sandbox: String,
     gen: u32,
 }
@@ -44,7 +46,8 @@ impl MuxOpener {
     pub fn start(mut input: impl std::io::Read + Send + 'static, mut output: impl std::io::Write + Send + 'static, sandbox: String) -> Self {
         let (to_launcher, outgoing) = channel::<ToLauncher>();
         let (browse_tx, browse_rx) = channel();
-        let route = Arc::new(Mutex::new(Route { gen: 0, out: None, waker: None, browse_waker: None }));
+        let (saved_tx, saved_rx) = channel();
+        let route = Arc::new(Mutex::new(Route { gen: 0, out: None, waker: None, browse_waker: None, save_waker: None }));
 
         std::thread::Builder::new()
             .name("mux-write".into())
@@ -96,13 +99,19 @@ impl MuxOpener {
                                 w();
                             }
                         }
+                        Ok(FromLauncher::Saved(s)) => {
+                            let _ = saved_tx.send(s);
+                            if let Some(w) = r.lock().ok().and_then(|g| g.save_waker.clone()) {
+                                w();
+                            }
+                        }
                         Err(e) => return fatal(format!("bad message from the launcher: {e}")),
                     }
                 }
             })
             .expect("spawn thread");
 
-        Self { to_launcher, route, browse_rx, sandbox, gen: 0 }
+        Self { to_launcher, route, browse_rx, saved_rx, sandbox, gen: 0 }
     }
 }
 
@@ -146,6 +155,17 @@ impl Opener for MuxOpener {
 
     fn poll_browse(&mut self) -> Option<DirListing> {
         self.browse_rx.try_recv().ok()
+    }
+
+    fn save(&mut self, id: u32, path: &str, data: Vec<u8>, replace: bool, waker: Waker) {
+        if let Ok(mut route) = self.route.lock() {
+            route.save_waker = Some(waker);
+        }
+        let _ = self.to_launcher.send(ToLauncher::Save { id, path: path.to_owned(), data, replace });
+    }
+
+    fn poll_saved(&mut self) -> Option<SavedFile> {
+        self.saved_rx.try_recv().ok()
     }
 
     fn new_window(&mut self, folder: Option<&Path>) {

@@ -12,9 +12,10 @@
 use egui::{Id, Pos2};
 use margin_code::Lang;
 use margin_md::MdDoc;
-use margin_proto::{ErrCode, RelPath, Reply, Request, SearchQuery, Skipped};
+use margin_proto::limits::MAX_OPEN_FILE;
+use margin_proto::{ErrCode, RelPath, Reply, Request, SavedFile, SearchQuery, Skipped};
 
-use crate::app::{waker, App, Modal, SaveAs, Then, HOT_DELAY};
+use crate::app::{waker, App, Modal, SaveAs, SaveOut, Then, HOT_DELAY};
 use crate::md_preview::{self, Link, Preview};
 use crate::ops::abs_path;
 use crate::sanitize::{clean, floor_char, sanitize};
@@ -154,7 +155,12 @@ impl App {
         if f.doc().is_none() {
             return;
         }
-        let text = if f.is_untitled() { String::new() } else { f.path.to_string() };
+        // No folder: an absolute path, starting from the file it was saved to, else the home directory.
+        let text = match (f.is_untitled(), self.ws.is_some()) {
+            (false, _) => f.path.to_string(),
+            (true, true) => String::new(),
+            (true, false) => f.external.clone().unwrap_or_else(|| "~/".to_owned()),
+        };
         self.palette = None;
         self.ctx_menu = None;
         self.modal = Some(Modal::SaveAs(SaveAs { tab, text, error: None, busy: false, then, focus: true }));
@@ -216,6 +222,95 @@ impl App {
         }
     }
 
+    // ---- Save without a folder: the opener writes the file ----
+
+    /// Send buffer `tab` to `path` (absolute, or `~/…`). `replace`: its own file, written before.
+    pub(crate) fn save_out(&mut self, tab: u64, path: &str, replace: bool, dialog: bool) -> Result<(), String> {
+        if self.saves_out.iter().any(|s| s.tab == tab) {
+            return Ok(());
+        }
+        let Some((data, rev)) = self.tabs.file_by_id(tab).and_then(|f| f.doc().map(|d| (d.text().into_bytes(), d.revision()))) else { return Ok(()) };
+        if data.len() > MAX_OPEN_FILE {
+            return Err("Too large to save".to_owned());
+        }
+        self.save_seq = self.save_seq.wrapping_add(1);
+        let id = self.save_seq;
+        self.saves_out.push(SaveOut { id, tab, rev, dialog });
+        self.opener.save(id, path, data, replace, waker(&self.ctx));
+        Ok(())
+    }
+
+    /// Enter / Save in the dialog while no folder is open.
+    pub(crate) fn save_out_submit(&mut self, tab: u64) {
+        let Some(text) = self.save_as_mut(tab).map(|s| s.text.clone()) else { return };
+        let path = match crate::ops::save_out_check(&text) {
+            Ok(p) => p,
+            Err(e) => return self.save_as_fail(tab, e),
+        };
+        let replace = self.tabs.file_by_id(tab).is_some_and(|f| f.external.as_deref() == Some(path.as_str()));
+        if let Some(s) = self.save_as_mut(tab) {
+            s.busy = true;
+            s.error = None;
+        }
+        if let Err(e) = self.save_out(tab, &path, replace, true) {
+            self.save_as_fail(tab, e);
+        }
+    }
+
+    pub(crate) fn on_saved_out(&mut self, s: SavedFile) {
+        let Some(i) = self.saves_out.iter().position(|p| p.id == s.id) else { return };
+        let p = self.saves_out.remove(i);
+        if !s.error.is_empty() || s.path.is_empty() {
+            let msg = if s.error.is_empty() { "Save failed".to_owned() } else { sanitize(&s.error, 200) };
+            if p.dialog {
+                self.save_as_fail(p.tab, msg);
+            } else {
+                self.after_save = None;
+                self.toasts.error(&format!("Not saved: {msg}"));
+            }
+            return;
+        }
+        let mut then = None;
+        if p.dialog {
+            then = self.save_as_mut(p.tab).and_then(|s| s.then.take());
+            if matches!(self.modal, Some(Modal::SaveAs(ref m)) if m.tab == p.tab) {
+                self.modal = None;
+            }
+            self.toasts.notice(&format!("Saved {}", sanitize(&s.path, 120)));
+        }
+        let mut hot = None;
+        if let Some(f) = self.tabs.file_by_id(p.tab) {
+            let name = s.path.rsplit(['/', '\\']).next().unwrap_or_default().to_owned();
+            f.external = Some(s.path);
+            if let View::Text(d) = &mut f.view {
+                if d.revision() == p.rev {
+                    d.mark_saved();
+                    // On disk now: no copy in the config dir until it is edited again.
+                    f.hot.written = Some(p.rev);
+                    hot = f.untitled;
+                }
+                d.set_lang(Lang::from_path(&name));
+            }
+            // The dialog closed: back to the text.
+            f.focus_editor |= p.dialog;
+        }
+        if let Some(n) = hot {
+            self.persist.remove_untitled(n);
+        }
+        self.tabs_changed = true;
+        self.focus_editor |= p.dialog;
+        // Saved on the way to closing it (Unsaved dialog).
+        if let Some(a) = self.after_save.as_mut() {
+            a.waiting.retain(|&w| w != p.tab);
+            if a.waiting.is_empty() {
+                then = then.or(self.after_save.take().map(|a| a.then));
+            }
+        }
+        if let Some(t) = then {
+            self.proceed(t);
+        }
+    }
+
     pub(crate) fn on_save_as_dir(&mut self, tab: u64, path: RelPath, rest: Vec<RelPath>, r: Reply) {
         match r {
             Reply::Done | Reply::Err { code: ErrCode::Exists, .. } => self.save_as_next(tab, path, rest),
@@ -235,6 +330,7 @@ impl App {
                 let mut hot = None;
                 if let Some(f) = self.tabs.file_by_id(tab) {
                     hot = f.untitled.take();
+                    f.external = None;
                     f.path = path.clone();
                     f.meta = Some(m);
                     f.banner = None;
@@ -433,6 +529,7 @@ impl App {
         let tab = self.tabs.by_id(id).map(|i| &self.tabs.list[i]);
         let is_file = tab.is_some_and(|t| t.file().is_some());
         let path = tab.and_then(|t| t.file()).filter(|f| !f.is_untitled()).map(|f| f.path.clone());
+        let external = tab.and_then(|t| t.file()).and_then(|f| f.external.clone());
         let in_group = self.tabs.group_index(group).map_or(0, |g| self.tabs.groups[g].tabs.len());
         let groups = self.tabs.groups.len();
         let room = groups < crate::tabs::MAX_GROUPS;
@@ -449,6 +546,9 @@ impl App {
             items.push(sep());
             items.push(item("Copy Path", CtxAct::CopyAbs(p.clone())));
             items.push(item("Copy Relative Path", CtxAct::Copy(p.to_string())));
+        } else if let Some(p) = external {
+            items.push(sep());
+            items.push(item("Copy Path", CtxAct::Copy(p)));
         }
         self.open_ctx(pos, items);
     }

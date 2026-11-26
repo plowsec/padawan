@@ -33,7 +33,7 @@ use crate::settings::Settings;
 use crate::side::{SideOut, SideSearch};
 use crate::state::{Persist, SavedState, SIDEBAR_W};
 use crate::status::{self, StatusInfo};
-use crate::tabs::{tab_id, Banner, DropAt, StripAction, TabKind, Tabs, View, MAX_GROUPS};
+use crate::tabs::{tab_id, Banner, DropAt, FileTab, StripAction, TabKind, Tabs, View, MAX_GROUPS};
 use crate::toast::Toasts;
 use crate::tree::Tree;
 use crate::welcome::{self, WelcomeOut};
@@ -53,6 +53,16 @@ pub enum Then {
     CloseFolder,
     Quit,
     Open(PathBuf),
+}
+
+/// A buffer on its way to a file outside any folder (`Opener::save`).
+pub struct SaveOut {
+    pub id: u32,
+    pub tab: u64,
+    /// Revision sent.
+    pub rev: u64,
+    /// Asked from the Save As dialog (errors go there), else `cmd+s` on a file saved before.
+    pub dialog: bool,
 }
 
 /// Save As dialog.
@@ -107,6 +117,16 @@ pub struct Smoke {
     pub done: bool,
     /// `MARGIN_SMOKE=clipboard`: copy a token, ask for a paste, expect it back. Overwrites the clipboard.
     pub clip: Option<Clip>,
+    /// `MARGIN_SMOKE=save`: write a buffer to `$MARGIN_SMOKE_SAVE` (absolute, must not exist) through the opener.
+    pub save: Option<SaveSmoke>,
+}
+
+/// Save-outside-a-folder round trip of the smoke run.
+pub struct SaveSmoke {
+    pub path: String,
+    pub tab: Option<u64>,
+    pub frames: u32,
+    pub ok: bool,
 }
 
 /// Clipboard round trip of the smoke run.
@@ -173,6 +193,9 @@ pub struct App {
     /// Secondary window: no hot-exit restore, no last session.
     pub(crate) fresh: bool,
     pub(crate) untitled_next: u32,
+    /// Saves outside a folder the opener has not answered yet.
+    pub(crate) saves_out: Vec<SaveOut>,
+    pub(crate) save_seq: u32,
     /// Edit actions sent to the editor (tests; last 64).
     pub(crate) edit_log: Vec<EditAction>,
     /// Preview outputs handled as if the preview returned them (tests).
@@ -254,6 +277,8 @@ impl App {
             editor_id: None,
             fresh: opts.fresh,
             untitled_next: 1,
+            saves_out: Vec::new(),
+            save_seq: 0,
             edit_log: Vec::new(),
             inject_md: Vec::new(),
             modal_seen: Default::default(),
@@ -283,7 +308,8 @@ impl App {
 
     pub(crate) fn enable_smoke(&mut self, verdict: Arc<Mutex<Option<Result<String, String>>>>) {
         let clip = std::env::var("MARGIN_SMOKE").is_ok_and(|v| v == "clipboard").then(|| Clip { token: format!("margin-smoke-{}", std::process::id()), frames: 0, ok: false });
-        self.smoke = Some(Smoke { start: std::time::Instant::now(), frames_after: 0, verdict, done: false, clip });
+        let save = std::env::var("MARGIN_SMOKE").is_ok_and(|v| v == "save").then(|| SaveSmoke { path: std::env::var("MARGIN_SMOKE_SAVE").unwrap_or_default(), tab: None, frames: 0, ok: false });
+        self.smoke = Some(Smoke { start: std::time::Instant::now(), frames_after: 0, verdict, done: false, clip, save });
     }
 
     /// Wait for queued config writes (tests).
@@ -1002,7 +1028,26 @@ impl App {
         }
     }
 
+    /// `MARGIN_SMOKE=save`: once the folder is ready, a new buffer goes to the opener.
+    fn smoke_save_start(&mut self) {
+        let ready = self.ws.as_ref().is_some_and(|w| w.root.is_some() && w.ready());
+        let Some(v) = self.smoke.as_mut().and_then(|s| s.save.as_mut()).filter(|v| ready && v.tab.is_none()) else { return };
+        let path = v.path.clone();
+        let n = self.untitled_next;
+        self.untitled_next = n.saturating_add(1);
+        let mut f = FileTab::untitled(n, "margin smoke\n");
+        // Never kept in the config dir, saved or not.
+        f.hot.written = f.doc().map(|d| d.revision());
+        self.tabs.add(TabKind::File(Box::new(f)));
+        let Some(tab) = self.tabs.active_tab().map(|t| t.id) else { return };
+        if let Some(v) = self.smoke.as_mut().and_then(|s| s.save.as_mut()) {
+            v.tab = Some(tab);
+        }
+        let _ = self.save_out(tab, &path, false, false);
+    }
+
     fn smoke_check(&mut self, ctx: &egui::Context) {
+        self.smoke_save_start();
         let Some(s) = self.smoke.as_mut() else { return };
         if s.done {
             return;
@@ -1035,6 +1080,14 @@ impl App {
                 clip_wait = !c.ok && c.frames < 60;
                 clip_note = format!(" clipboard={}", if c.ok { "ok" } else { "FAILED" });
             }
+            // Save: started by `smoke_save_start`; done when the tab got its path (120 frames).
+            if let Some(v) = s.save.as_mut().filter(|v| v.tab.is_some()) {
+                v.frames += 1;
+                v.ok = v.tab.and_then(|t| self.tabs.by_id(t)).and_then(|i| self.tabs.list[i].file()).is_some_and(|f| f.external.is_some() && !f.dirty());
+                clip_wait |= !v.ok && v.frames < 120;
+                clip_note.push_str(if v.ok { " save=ok" } else { " save=FAILED" });
+            }
+            clip_wait |= s.save.as_ref().is_some_and(|v| v.tab.is_none());
             (s.frames_after > 3 && !clip_wait).then(|| {
                 let ws = self.ws.as_ref();
                 let name = ws.map(Workspace::display_name).unwrap_or_default();

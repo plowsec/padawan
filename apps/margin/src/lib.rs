@@ -2,7 +2,7 @@
 //!
 //! | Role | Process | Sandbox (macOS) | Touches |
 //! |---|---|---|---|
-//! | launcher (default) | parent | none: it handles no file content | starts the two others, relays frames, lists directories for the folder picker |
+//! | launcher (default) | parent | none: it parses no file content | starts the two others, relays frames, lists directories for the folder picker, writes a buffer saved without a folder (`save.rs`) |
 //! | `--role gui` | child | no network, no exec, no user files, writes only the config dir | window, input, rendering |
 //! | `--role worker` | child, one per open folder | deny-default: the folder + its cache dir, nothing else | every file of the folder |
 //!
@@ -18,6 +18,7 @@ pub mod local;
 pub mod mux_client;
 pub mod probe;
 pub mod sandbox;
+pub mod save;
 pub mod window;
 pub mod worker;
 

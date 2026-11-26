@@ -136,6 +136,9 @@ pub fn worker_command(sb: Sandbox, p: &WorkerPaths<'_>) -> Command {
     c
 }
 
+/// Under the home directory: credentials and start-up items. No worker gets them, nothing is saved into them.
+pub const SENSITIVE: [&str; 12] = ["Library", "AppData", ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config", ".local", ".cargo", ".rustup", ".claude"];
+
 /// May this folder be opened? The worker gets read/write on it, so refuse the places where a write means
 /// code execution or credential theft later. Returns the canonical path.
 pub fn check_root(path: &Path, home: Option<&Path>, own_dirs: &[&Path]) -> Result<PathBuf, String> {
@@ -153,7 +156,7 @@ pub fn check_root(path: &Path, home: Option<&Path>, own_dirs: &[&Path]) -> Resul
         if home.starts_with(&root) {
             return Err(format!("refusing to open {}: it is or contains your home directory. Open a sub-folder.", root.display()));
         }
-        for sensitive in ["Library", "AppData", ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config", ".local", ".cargo", ".rustup", ".claude"] {
+        for sensitive in SENSITIVE {
             let s = home.join(sensitive);
             if root.starts_with(&s) || s.starts_with(&root) {
                 return Err(format!("refusing to open {}: it holds credentials or start-up items (~/{sensitive})", root.display()));

@@ -100,6 +100,8 @@ pub fn filtered(path: &str, include: &str, exclude: &str) -> bool {
     (inc.is_empty() || inc.iter().any(|g| glob(g, path))) && !exc.iter().any(|g| glob(g, path))
 }
 
+pub type SavedCall = (String, Vec<u8>, bool);
+
 #[derive(Clone)]
 pub struct Fake {
     pub fs: Arc<Mutex<FakeFs>>,
@@ -108,6 +110,8 @@ pub struct Fake {
     pub opened: Arc<Mutex<Vec<String>>>,
     /// `Opener::new_window` calls.
     pub windows: Arc<Mutex<Vec<Option<PathBuf>>>>,
+    /// `Opener::save` calls that wrote: `(path, data, replace)`.
+    pub saved: Arc<Mutex<Vec<SavedCall>>>,
 }
 
 impl Fake {
@@ -116,7 +120,7 @@ impl Fake {
         for (p, d) in files {
             fs.add(p, d.as_bytes().to_vec());
         }
-        Fake { fs: Arc::new(Mutex::new(fs)), log: Default::default(), script: Default::default(), opened: Default::default(), windows: Default::default() }
+        Fake { fs: Arc::new(Mutex::new(fs)), log: Default::default(), script: Default::default(), opened: Default::default(), windows: Default::default(), saved: Default::default() }
     }
 
     pub fn requests(&self) -> Vec<Request> {
@@ -414,6 +418,7 @@ pub struct FakeOpener {
     pub sandbox: String,
     pub listings: HashMap<String, DirListing>,
     queue: VecDeque<DirListing>,
+    saved: VecDeque<SavedFile>,
 }
 
 impl FakeOpener {
@@ -422,7 +427,7 @@ impl FakeOpener {
         let dirs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         listings.insert("/home/me".into(), DirListing { path: "/home/me".into(), parent: Some("/home".into()), dirs: dirs(&["Documents", "Downloads", "dev", "notes"]), error: String::new() });
         listings.insert("/home/me/dev".into(), DirListing { path: "/home/me/dev".into(), parent: Some("/home/me".into()), dirs: dirs(&["margin", "parser-c", "website"]), error: String::new() });
-        FakeOpener { fake, sandbox: "seatbelt".into(), listings, queue: VecDeque::new() }
+        FakeOpener { fake, sandbox: "seatbelt".into(), listings, queue: VecDeque::new(), saved: VecDeque::new() }
     }
 }
 
@@ -444,6 +449,32 @@ impl Opener for FakeOpener {
 
     fn poll_browse(&mut self) -> Option<DirListing> {
         self.queue.pop_front()
+    }
+
+    /// The launcher's rules in short: `~` is `/home/me`, `~/.ssh` is refused, a file is new or was written here.
+    fn save(&mut self, id: u32, path: &str, data: Vec<u8>, replace: bool, waker: Waker) {
+        let abs = path.strip_prefix("~/").map_or(path.to_owned(), |rest| format!("/home/me/{rest}"));
+        let name = abs.rsplit('/').next().unwrap_or_default().to_owned();
+        let mut saved = self.fake.saved.lock().unwrap();
+        let mine = saved.iter().any(|s| s.0 == abs);
+        let error = if abs.starts_with("/home/me/.ssh/") {
+            "refusing to write in /home/me/.ssh: it holds credentials or start-up items (~/.ssh)".to_owned()
+        } else if abs == "/home/me/notes/theirs.md" || (mine && !replace) {
+            format!("{name} already exists")
+        } else {
+            String::new()
+        };
+        if error.is_empty() {
+            saved.push((abs.clone(), data, replace));
+            self.saved.push_back(SavedFile { id, path: abs, error });
+        } else {
+            self.saved.push_back(SavedFile { id, path: String::new(), error });
+        }
+        waker();
+    }
+
+    fn poll_saved(&mut self) -> Option<SavedFile> {
+        self.saved.pop_front()
     }
 
     fn new_window(&mut self, folder: Option<&Path>) {

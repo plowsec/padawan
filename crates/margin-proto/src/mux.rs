@@ -2,8 +2,8 @@
 //! for a worker on a folder, then engine frames are relayed both ways, tagged with the worker generation
 //! (frames of a replaced worker are dropped).
 
-use crate::limits::{MAX_DIR_ENTRIES, MAX_FRAME, MAX_NAME, MAX_PATH, MAX_TEXT};
-use crate::link::DirListing;
+use crate::limits::{MAX_DIR_ENTRIES, MAX_FRAME, MAX_NAME, MAX_OPEN_FILE, MAX_PATH, MAX_TEXT};
+use crate::link::{DirListing, SavedFile};
 use crate::msg::{IndexOpts, Wire};
 use crate::wire::{Dec, Enc, WireError, WireResult};
 
@@ -22,6 +22,8 @@ pub enum ToLauncher {
     Browse { path: String },
     /// Open another window (a new launcher process). `folder`: absolute path to open there; empty = none.
     NewWindow { folder: String },
+    /// Write a buffer that belongs to no folder (`Opener::save`). The launcher checks `path`.
+    Save { id: u32, path: String, data: Vec<u8>, replace: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +34,8 @@ pub enum FromLauncher {
     Ended { gen: u32, msg: String },
     /// Answer to `Browse`.
     Dirs(DirListing),
+    /// Answer to `Save`.
+    Saved(SavedFile),
 }
 
 impl ToLauncher {
@@ -58,6 +62,13 @@ impl ToLauncher {
                 e.u8(5);
                 e.str(folder);
             }
+            ToLauncher::Save { id, path, data, replace } => {
+                e.u8(6);
+                e.u32(*id);
+                e.str(path);
+                e.bytes(data);
+                e.bool(*replace);
+            }
         }
         e.finish()
     }
@@ -70,6 +81,7 @@ impl ToLauncher {
             3 => ToLauncher::Quit,
             4 => ToLauncher::Browse { path: d.string(MAX_PATH)? },
             5 => ToLauncher::NewWindow { folder: d.string(MAX_PATH)? },
+            6 => ToLauncher::Save { id: d.u32()?, path: d.string(MAX_PATH)?, data: d.bytes(MAX_OPEN_FILE)?.to_vec(), replace: d.bool()? },
             t => return Err(WireError::BadTag(t)),
         };
         d.finish()?;
@@ -98,6 +110,12 @@ impl FromLauncher {
                 e.seq(&l.dirs, |e, n| e.str(n));
                 e.str(&l.error);
             }
+            FromLauncher::Saved(s) => {
+                e.u8(4);
+                e.u32(s.id);
+                e.str(&s.path);
+                e.str(&s.error);
+            }
         }
         e.finish()
     }
@@ -113,6 +131,7 @@ impl FromLauncher {
                 dirs: d.seq(MAX_DIR_ENTRIES, 4, |d| d.string(MAX_NAME))?,
                 error: d.string(MAX_TEXT)?,
             }),
+            4 => FromLauncher::Saved(SavedFile { id: d.u32()?, path: d.string(MAX_PATH)?, error: d.string(MAX_TEXT)? }),
             t => return Err(WireError::BadTag(t)),
         };
         d.finish()?;
@@ -133,11 +152,13 @@ mod tests {
             ToLauncher::Browse { path: "/tmp".into() },
             ToLauncher::NewWindow { folder: String::new() },
             ToLauncher::NewWindow { folder: "/tmp/x".into() },
+            ToLauncher::Save { id: 7, path: "~/notes/a.md".into(), data: b"text".to_vec(), replace: true },
         ] {
             assert_eq!(ToLauncher::decode(&m.encode()).unwrap(), m);
         }
         let dirs = DirListing { path: "/a".into(), parent: Some("/".into()), dirs: vec!["b".into(), "c d".into()], error: String::new() };
-        for m in [FromLauncher::Engine { gen: 1, payload: vec![] }, FromLauncher::Ended { gen: 1, msg: "x".into() }, FromLauncher::Dirs(dirs)] {
+        let saved = SavedFile { id: 7, path: "/home/me/notes/a.md".into(), error: String::new() };
+        for m in [FromLauncher::Engine { gen: 1, payload: vec![] }, FromLauncher::Ended { gen: 1, msg: "x".into() }, FromLauncher::Dirs(dirs), FromLauncher::Saved(saved)] {
             assert_eq!(FromLauncher::decode(&m.encode()).unwrap(), m);
         }
         assert!(ToLauncher::decode(&[9]).is_err());

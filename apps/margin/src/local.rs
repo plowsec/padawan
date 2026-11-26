@@ -2,21 +2,29 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use margin_engine::EngineConfig;
-use margin_proto::{Client, DirListing, Event, IndexOpts, Opener, Out, Waker};
+use margin_proto::{Client, DirListing, Event, IndexOpts, Opener, Out, SavedFile, Waker};
+
+use crate::save::Saver;
 
 pub struct LocalOpener {
     cache: Option<PathBuf>,
     config: Option<PathBuf>,
     browse_tx: Sender<DirListing>,
     browse_rx: Receiver<DirListing>,
+    saver: Arc<Mutex<Saver>>,
+    saved_tx: Sender<SavedFile>,
+    saved_rx: Receiver<SavedFile>,
 }
 
 impl LocalOpener {
     pub fn new(cache: Option<PathBuf>, config: Option<PathBuf>) -> Self {
         let (browse_tx, browse_rx) = channel();
-        Self { cache, config, browse_tx, browse_rx }
+        let (saved_tx, saved_rx) = channel();
+        let saver = Arc::new(Mutex::new(Saver::new(crate::dirs::home(), cache.iter().chain(config.iter()).cloned().collect())));
+        Self { cache, config, browse_tx, browse_rx, saver, saved_tx, saved_rx }
     }
 }
 
@@ -55,6 +63,18 @@ impl Opener for LocalOpener {
 
     fn poll_browse(&mut self) -> Option<DirListing> {
         self.browse_rx.try_recv().ok()
+    }
+
+    fn save(&mut self, id: u32, path: &str, data: Vec<u8>, replace: bool, waker: Waker) {
+        let (tx, saver, path) = (self.saved_tx.clone(), self.saver.clone(), path.to_owned());
+        let _ = std::thread::Builder::new().name("save".into()).spawn(move || {
+            let _ = tx.send(crate::save::answer(&saver, id, &path, &data, replace));
+            waker();
+        });
+    }
+
+    fn poll_saved(&mut self) -> Option<SavedFile> {
+        self.saved_rx.try_recv().ok()
     }
 
     fn new_window(&mut self, folder: Option<&Path>) {

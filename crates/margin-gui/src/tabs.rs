@@ -84,6 +84,8 @@ pub struct FileTab {
     pub focus_editor: bool,
     /// `Some(n)`: `Untitled-n`, not on disk; `path` is the root.
     pub untitled: Option<u32>,
+    /// Untitled buffer saved outside any folder: the absolute path it was written to. `cmd+s` writes there again.
+    pub external: Option<String>,
     pub hot: HotExit,
     pub preview: Option<Box<Preview>>,
     /// `#fragment` to jump to once a Markdown file loads.
@@ -119,6 +121,7 @@ impl FileTab {
             pending_select: None,
             focus_editor: true,
             untitled: None,
+            external: None,
             hot: HotExit::default(),
             preview: None,
             pending_anchor: None,
@@ -139,6 +142,11 @@ impl FileTab {
         self.untitled.is_some()
     }
 
+    /// Untitled and never saved anywhere: saving it means asking for a path.
+    pub fn unsaved_buffer(&self) -> bool {
+        self.untitled.is_some() && self.external.is_none()
+    }
+
     pub fn doc(&self) -> Option<&Document> {
         match &self.view {
             View::Text(d) => Some(d),
@@ -146,18 +154,19 @@ impl FileTab {
         }
     }
 
-    /// Untitled: has text. File: edited since saved.
+    /// Untitled: has text. File (in the folder, or saved outside one): edited since saved.
     pub fn dirty(&self) -> bool {
         match self.untitled {
-            Some(_) => self.doc().is_some_and(|d| d.len_bytes() > 0),
-            None => self.doc().is_some_and(Document::is_dirty),
+            Some(_) if self.external.is_none() => self.doc().is_some_and(|d| d.len_bytes() > 0),
+            _ => self.doc().is_some_and(Document::is_dirty),
         }
     }
 
     pub fn title(&self) -> String {
-        match self.untitled {
-            Some(n) => format!("Untitled-{n}"),
-            None => clean(self.path.name()),
+        match (&self.external, self.untitled) {
+            (Some(p), _) => clean(p.rsplit(['/', '\\']).next().unwrap_or(p)),
+            (None, Some(n)) => format!("Untitled-{n}"),
+            (None, None) => clean(self.path.name()),
         }
     }
 

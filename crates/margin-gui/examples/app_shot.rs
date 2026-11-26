@@ -245,7 +245,7 @@ fn shots(out: &Path, mode: &str, suffix: &str, scale: f32, size: [f32; 2], setti
     let mut a = H::build(&files(), script, Some("/home/me/dev/parser-c"), size, scale, &conf);
     a.opened();
     a.app_open("src/parser.c");
-    a.until("sinks hint", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks"))));
+    a.until("sinks hint", |p| p.lenses.iter().any(|l| l.1.iter().any(|s| s.starts_with("sinks")) && l.1.iter().any(|s| s.contains("caller"))));
     a.frames(5);
     let p = a.probe();
     let line = p.lenses.iter().find(|l| l.1.iter().any(|s| s.starts_with("sinks"))).unwrap().0;

@@ -1,5 +1,6 @@
 //! The launcher: the only process outside a sandbox, so the only one that can start the others.
 //! It never reads file content and never decodes engine messages: it checks frame sizes and relays.
+//! The one file it writes: a buffer saved while no folder is open (`save.rs`, path policy there).
 //!
 //! ```text
 //!  gui (sandboxed) ──ToLauncher──▶ launcher ──frames──▶ worker (sandboxed, one per folder)
@@ -12,6 +13,7 @@
 //! | `Engine { gen, payload }` | writes `payload` to the worker of `gen`; stale generations are dropped |
 //! | `Browse { path }` | lists sub-directory names (folder picker) |
 //! | `NewWindow { folder }` | starts another launcher (rate-limited) |
+//! | `Save { id, path, data, replace }` | checks the path, writes the file, answers `Saved` |
 //! | `Quit` / end of stream / bad frame | stops the worker, exits |
 
 use std::io::Write;
@@ -79,6 +81,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     let mut from_gui = gui.stdout.take().ok_or("no pipe from the window process")?;
     let to_gui = Arc::new(Mutex::new(gui.stdin.take().ok_or("no pipe to the window process")?));
 
+    let saver = Arc::new(Mutex::new(crate::save::Saver::new(Some(home.clone()), vec![cache.clone(), config.clone()])));
     let mut relay = Relay { sb, exe, cache, config, home, to_gui, worker: None };
     // Ends when the window closes (end of stream) or its pipe breaks.
     while let Ok(Some(buf)) = read_frame(&mut from_gui, MAX_MUX_FRAME) {
@@ -98,6 +101,13 @@ pub fn run(args: &Args) -> Result<(), String> {
                 if let Err(e) = crate::window::spawn(folder, false) {
                     eprintln!("margin: {e}");
                 }
+            }
+            Ok(ToLauncher::Save { id, path, data, replace }) => {
+                // Slow on a network mount: not on the relay thread.
+                let (to_gui, saver) = (relay.to_gui.clone(), saver.clone());
+                let _ = std::thread::Builder::new().name("save".into()).spawn(move || {
+                    send(&to_gui, &FromLauncher::Saved(crate::save::answer(&saver, id, &path, &data, replace)));
+                });
             }
             Ok(ToLauncher::Quit) => break,
             Err(e) => {
