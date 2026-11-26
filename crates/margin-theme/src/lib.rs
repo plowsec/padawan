@@ -5,6 +5,7 @@
 //! Widgets read colours from `Theme`, never hard-code them.
 
 pub mod fonts;
+pub mod icon;
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle};
 

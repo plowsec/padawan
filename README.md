@@ -13,7 +13,10 @@ margin /abs/folder                        # open a folder
 margin /abs/folder/file.md                # open its folder and the file
 margin --check-sandbox                    # try to break out of both sandboxes, print the result
 margin --no-sandbox /abs/folder           # one process, no OS sandbox (debugging, non-macOS)
+margin --install-desktop                  # Linux: menu entry + icon for this user (--uninstall-desktop removes them)
 ```
+
+Icon on Linux: X11 shows it without setup. Wayland takes it from the desktop entry: run `margin --install-desktop` once, and again after moving the binary.
 
 ## Status
 
@@ -133,7 +136,7 @@ By name, from token heuristics: leads for a reader, not proofs. Not tracked: ret
 | `crates/margin-editor` | the editor widget |
 | `crates/margin-md` | Markdown parser and preview. Safe Rust, written here |
 | `crates/margin-gui` | window: sidebar, tabs, menus, palette, search tabs, call paths, settings |
-| `crates/margin-theme` | palettes, fonts, egui style |
+| `crates/margin-theme` | palettes, fonts, egui style, the icon (drawn in code) |
 | `crates/margin-shot`, `margin-testutil` | headless render to PNG; `TempDir` for tests |
 | `docs/security.md` | threat model, sandbox, known limits |
 | `docs/deps.md` | dependencies and what was written here instead |
@@ -146,6 +149,7 @@ By name, from token heuristics: leads for a reader, not proofs. Not tracked: ret
 | Unsaved untitled tabs | `~/.config/margin/untitled/` |
 | Index cache (per folder) | `~/Library/Caches/margin/roots/<hash>/` (Linux: `~/.cache/margin`) |
 | Windows | `%APPDATA%\margin` (settings, untitled), `%LOCALAPPDATA%\margin` (cache) |
+| Linux menu entry, icons (`--install-desktop` only) | `~/.local/share/applications/margin.desktop`, `~/.local/share/icons/hicolor/<n>x<n>/apps/margin.png` |
 
 Nothing is written into an opened folder except the files you save.
 
@@ -154,7 +158,7 @@ Nothing is written into an opened folder except the files you save.
 ```bash
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
-cargo run -p margin-gui --example app_shot -- /abs/out/dir     # screenshots of the main states
+cargo run -p margin-gui --example app_shot -- /abs/out/dir     # screenshots of the main states, icon PNGs
 scripts/sign.sh                                                # macOS: codesign target/release/margin (ad hoc; MARGIN_SIGN_ID="<identity>" for yours)
 MARGIN_SMOKE=1 target/debug/margin /abs/folder                 # start, index, print `smoke: ok …`, exit
 MARGIN_SMOKE=clipboard target/debug/margin /abs/folder         # same + copy/paste round trip (overwrites the clipboard)

@@ -1,4 +1,4 @@
-//! Render the key states of the app to PNG with the fake engine.
+//! Render the key states of the app to PNG with the fake engine, and the app icon (`icon-<size>.png`).
 //!
 //! `cargo run -p margin-gui --example app_shot -- <abs out dir> [scale] [width height] [ui_size]`
 
@@ -147,6 +147,10 @@ fn main() {
     for mode in ["dark", "light"] {
         let settings = format!("{conf}theme = {mode}\n");
         shots(&out, mode, &suffix, scale, [w, h], &settings);
+    }
+    for size in [16, 32, 48, 256] {
+        let png = margin_shot::png::encode(size, size, &margin_theme::icon::rgba(size, 0.03)).expect("icon png");
+        std::fs::write(out.join(format!("icon-{size}.png")), png).expect("write icon");
     }
 }
 

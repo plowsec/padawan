@@ -11,6 +11,7 @@
 pub mod args;
 pub mod browse;
 pub mod check;
+pub mod desktop;
 pub mod dirs;
 pub mod launcher;
 pub mod local;
@@ -28,9 +29,11 @@ use args::{Args, Role};
 const HELP: &str = "\
 margin [OPTIONS] [PATH]
 
-  PATH            folder to open, or a file (its folder is opened)
-  --no-sandbox    one process, no OS sandbox
-  --check-sandbox try to break out of both sandboxes, print what was refused
+  PATH                 folder to open, or a file (its folder is opened)
+  --no-sandbox         one process, no OS sandbox
+  --check-sandbox      try to break out of both sandboxes, print what was refused
+  --install-desktop    Linux: menu entry and icon for this user, pointing at this binary
+  --uninstall-desktop  remove them
   --version
   --help
 
@@ -59,6 +62,8 @@ pub fn main_entry() -> ExitCode {
         Role::Gui => mux_client::run_gui(&args),
         Role::Worker => worker::run(&args),
         Role::Check => check::run(),
+        Role::InstallDesktop => desktop::run(false),
+        Role::UninstallDesktop => desktop::run(true),
         Role::Probe => probe::run(&args),
     };
     match result {

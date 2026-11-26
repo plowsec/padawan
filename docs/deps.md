@@ -11,7 +11,7 @@ Versions vetted on 2026-11-20 (first release ≥ 90 days, download thresholds, k
 | regex | 1.13.1 | engine | content search (linear time) |
 | memchr | 2.8.3 | engine | substring search |
 | rayon | 1.12.0 | engine | parallel walk, index, search |
-| flate2 | 1.1.x | margin-shot (dev) | PNG encoder; already in the lock through eframe |
+| flate2 | 1.1.x | margin-shot (tests; the binary for `--install-desktop` icons) | PNG encoder; already in the lock through eframe |
 
 Worker process (the one that reads hostile files) links: `regex`, `memchr`, `rayon` and their dependencies (`aho-corasick`, `regex-automata`, `regex-syntax`, `rayon-core`, `crossbeam-*`, `either`). Nothing else third-party runs its own logic there.
 

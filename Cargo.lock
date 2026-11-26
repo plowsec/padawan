@@ -1238,7 +1238,9 @@ dependencies = [
  "margin-engine",
  "margin-gui",
  "margin-proto",
+ "margin-shot",
  "margin-testutil",
+ "margin-theme",
 ]
 
 [[package]]

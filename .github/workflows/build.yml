@@ -92,6 +92,9 @@ jobs:
           fi
           code=0
           MARGIN_SMOKE=1 $run "$BIN" "$PWD/crates/margin-md" > smoke.log 2>&1 || code=$?
+          if [ "$RUNNER_OS" = Linux ]; then
+            XDG_DATA_HOME="$RUNNER_TEMP/share" "$BIN" --install-desktop >> smoke.log 2>&1 || code=$?
+          fi
           cat smoke.log
           msg=$(tail -n 12 smoke.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           if [ "$code" = 0 ]; then echo "::notice title=smoke $NAME::$msg"; else echo "::warning title=smoke $NAME failed ($code)::$msg"; fi

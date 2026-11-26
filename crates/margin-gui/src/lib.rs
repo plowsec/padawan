@@ -86,6 +86,10 @@ impl eframe::App for Shell {
     }
 }
 
+/// Wayland app id and X11 `WM_CLASS`. A desktop entry must be named `<APP_ID>.desktop` to give the window its icon.
+pub const APP_ID: &str = "margin";
+const ICON_SIZE: u32 = 256;
+
 /// Open the window and run until it closes.
 ///
 /// `MARGIN_SMOKE` set: after the start folder (and file) loaded and the index is ready, print
@@ -94,8 +98,11 @@ pub fn run(opts: RunOpts) -> Result<(), String> {
     let smoke = std::env::var_os("MARGIN_SMOKE").is_some();
     let verdict = std::sync::Arc::new(std::sync::Mutex::new(None::<Result<String, String>>));
     let v2 = verdict.clone();
+    // X11 and Windows take the icon from the window, macOS puts it in the Dock. Wayland ignores it:
+    // there the icon comes from `margin.desktop` (same name as the app id), see `margin --install-desktop`.
+    let icon = egui::IconData { rgba: margin_theme::icon::rgba(ICON_SIZE, if cfg!(target_os = "macos") { 0.1 } else { 0.03 }), width: ICON_SIZE, height: ICON_SIZE };
     let native = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Margin").with_app_id("margin").with_inner_size([1280.0, 820.0]).with_min_inner_size([640.0, 400.0]),
+        viewport: egui::ViewportBuilder::default().with_title("Margin").with_app_id(APP_ID).with_icon(icon).with_inner_size([1280.0, 820.0]).with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
     let mut opts = Some(opts);

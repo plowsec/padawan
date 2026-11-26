@@ -14,6 +14,9 @@ pub enum Role {
     Check,
     /// Child of `--check-sandbox`: tries what the sandbox must refuse.
     Probe,
+    /// `--install-desktop` / `--uninstall-desktop`: menu entry and icons (Linux, BSD).
+    InstallDesktop,
+    UninstallDesktop,
     Help,
     Version,
 }
@@ -75,6 +78,8 @@ impl Args {
                 "--no-sandbox" => a.no_sandbox = true,
                 "--fresh" => a.fresh = true,
                 "--check-sandbox" => a.role = Role::Check,
+                "--install-desktop" => a.role = Role::InstallDesktop,
+                "--uninstall-desktop" => a.role = Role::UninstallDesktop,
                 "--role" => {
                     a.role = match value("--role")?.to_string_lossy().as_ref() {
                         "gui" => Role::Gui,
@@ -141,6 +146,8 @@ mod tests {
         assert!(parse(&["--nope"]).is_err());
         assert!(parse(&["--role"]).is_err());
         assert_eq!(parse(&["--help"]).unwrap().role, Role::Help);
+        assert_eq!(parse(&["--install-desktop"]).unwrap().role, Role::InstallDesktop);
+        assert_eq!(parse(&["--uninstall-desktop"]).unwrap().role, Role::UninstallDesktop);
     }
 
     #[test]

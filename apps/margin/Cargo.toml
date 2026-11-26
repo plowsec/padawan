@@ -21,6 +21,9 @@ path = "src/main.rs"
 margin-proto.workspace = true
 margin-engine.workspace = true
 margin-gui.workspace = true
+# Icon pixels and the PNG encoder, for `--install-desktop`.
+margin-theme.workspace = true
+margin-shot.workspace = true
 
 [dev-dependencies]
 margin-testutil.workspace = true
